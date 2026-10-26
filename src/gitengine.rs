@@ -18,6 +18,9 @@ pub struct Git {
     net_timeout: Duration,
     allow_hooks: bool,
     token: Option<String>,
+    /// Dossier vide servant de « hooksPath » (plus fiable que /dev/null sous Windows).
+    nohooks: String,
+    pub version: (u32, u32),
 }
 
 #[derive(Debug, Clone)]
@@ -66,7 +69,21 @@ impl Git {
             cmd.arg("--version");
             if let Ok(o) = run_cmd(&mut cmd, None, Duration::from_secs(10)) {
                 if o.ok() && o.stdout.starts_with("git version") {
+                    let version = parse_version(&o.stdout);
+                    if version < (2, 23) {
+                        return Err(format!(
+                            "Git {}.{} est trop ancien : GIT DRENN nécessite Git 2.23 ou plus récent (idéalement 2.31+). Mettez Git à jour : https://git-scm.com",
+                            version.0, version.1
+                        ));
+                    }
+                    let hooks_dir = crate::util::drenn_dir().join("nohooks");
+                    let nohooks = match std::fs::create_dir_all(&hooks_dir) {
+                        Ok(_) => hooks_dir.to_string_lossy().replace('\\', "/"),
+                        Err(_) => "/dev/null".to_string(),
+                    };
                     return Ok(Git {
+                        nohooks,
+                        version,
                         bin: c,
                         timeout: Duration::from_secs(cfg.git_timeout_secs),
                         net_timeout: Duration::from_secs(cfg.network_timeout_secs),
@@ -89,14 +106,19 @@ impl Git {
         let mut cmd = Command::new(&self.bin);
         cmd.args(["-c", "core.quotepath=false", "-c", "protocol.ext.allow=never", "-c", "core.fsmonitor=false"]);
         if !self.allow_hooks {
-            cmd.args(["-c", "core.hooksPath=/dev/null"]);
+            cmd.arg("-c").arg(format!("core.hooksPath={}", self.nohooks));
         }
         cmd.args(args).current_dir(cwd);
         cmd.env("GIT_TERMINAL_PROMPT", "0")
-            .env("GIT_LITERAL_PATHSPECS", "1")
             .env("GIT_PAGER", "cat")
             .env("LC_ALL", "C")
             .env("LANGUAGE", "C");
+        // Pathspecs littéraux (noms de fichiers à caractères spéciaux). Exception : `git stash -u` nettoie les
+        // fichiers non suivis avec ses propres pathspecs internes, qui cessent de fonctionner en mode littéral.
+        // Les commandes stash de GIT DRENN n'acceptent jamais de pathspec issu de l'utilisateur.
+        if args.first() != Some(&"stash") {
+            cmd.env("GIT_LITERAL_PATHSPECS", "1");
+        }
         if kind == Kind::Net {
             if let Some(t) = &self.token {
                 // Jeton transmis par variables d'environnement (jamais en argument), limité à github.com.
@@ -197,6 +219,13 @@ impl Git {
     }
 }
 
+/// Extrait (majeur, mineur) de « git version 2.43.0.windows.1 ».
+pub fn parse_version(s: &str) -> (u32, u32) {
+    let v = s.trim().trim_start_matches("git version").trim();
+    let mut it = v.split(|c: char| !c.is_ascii_digit()).filter(|x| !x.is_empty()).map(|x| x.parse::<u32>().unwrap_or(0));
+    (it.next().unwrap_or(0), it.next().unwrap_or(0))
+}
+
 /// Traduit les erreurs Git les plus courantes en cause probable + piste de correction.
 pub fn explain_error(msg: &str) -> Option<String> {
     let m = msg.to_lowercase();
@@ -236,4 +265,15 @@ pub fn explain_error(msg: &str) -> Option<String> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_version;
+    #[test]
+    fn versions() {
+        assert_eq!(parse_version("git version 2.43.0.windows.1\n"), (2, 43));
+        assert_eq!(parse_version("git version 2.20.1"), (2, 20));
+        assert_eq!(parse_version("n'importe quoi"), (0, 0));
+    }
 }

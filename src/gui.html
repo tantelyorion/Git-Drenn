@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="fr"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>GIT DRENN</title>
+<style>
+:root{--bg:#fafafa;--fg:#222;--card:#fff;--line:#e3e3e3;--accent:#ff6b1a;--ok:#1a7f37;--err:#c62828;--warn:#9a6700;--muted:#6b6b6b}
+@media (prefers-color-scheme:dark){:root{--bg:#161616;--fg:#eee;--card:#202020;--line:#333;--ok:#4cc16b;--err:#ff6b6b;--warn:#e3b341;--muted:#9a9a9a}}
+*{box-sizing:border-box}body{margin:0;font:15px/1.45 system-ui,Segoe UI,sans-serif;background:var(--bg);color:var(--fg);display:flex;flex-direction:column;height:100vh}
+header{display:flex;align-items:center;gap:12px;padding:10px 16px;border-bottom:2px solid var(--accent);background:var(--card)}
+header img{width:52px;height:52px;border-radius:50%}header h1{font-size:18px;margin:0}header small{color:var(--muted);display:block;font-size:12px;word-break:break-all}
+header .hb{display:flex;gap:6px;margin-left:auto}
+#info{position:fixed;inset:0;background:rgba(0,0,0,.5);display:none;align-items:center;justify-content:center;padding:16px}
+#ibox{background:var(--card);border-radius:14px;padding:20px;max-width:620px;width:100%;max-height:85vh;overflow:auto;border-top:4px solid var(--accent)}
+#ibox h2{margin:0 0 10px;font-size:17px}#ibox pre{white-space:pre-wrap;font:inherit;margin:0 0 14px}
+.credit{font-size:12px;color:var(--muted);text-align:center;margin-top:8px}
+#log{flex:1;overflow:auto;padding:14px 16px}
+.ev{white-space:pre-wrap;word-break:break-word;margin:3px 0;font-family:ui-monospace,Consolas,monospace;font-size:13.5px}
+.ev.user{font-family:inherit;font-size:15px;background:var(--accent);color:#fff;padding:8px 12px;border-radius:14px 14px 4px 14px;margin:12px 0 8px auto;max-width:80%;width:fit-content}
+.ev.ok{color:var(--ok)}.ev.err{color:var(--err);font-weight:600}.ev.warn{color:var(--warn)}.ev.info{color:var(--muted)}
+.ev.done{color:var(--muted);font-size:12px;border-top:1px dashed var(--line);margin-top:10px;padding-top:6px}
+footer{padding:10px 16px;border-top:1px solid var(--line);background:var(--card)}
+.chips{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:8px}
+button{font:inherit;border:1px solid var(--line);background:var(--card);color:var(--fg);border-radius:16px;padding:5px 12px;cursor:pointer}
+button:hover{border-color:var(--accent)}button.primary{background:var(--accent);border-color:var(--accent);color:#fff}button.danger{background:var(--err);border-color:var(--err);color:#fff}
+form{display:flex;gap:8px}input[type=text]{flex:1;font:inherit;padding:9px 12px;border:1px solid var(--line);border-radius:10px;background:var(--bg);color:var(--fg)}
+#modal{position:fixed;inset:0;background:rgba(0,0,0,.5);display:none;align-items:center;justify-content:center;padding:16px}
+#box{background:var(--card);border-radius:14px;padding:20px;max-width:560px;width:100%;border-top:4px solid var(--accent)}
+#box p{white-space:pre-wrap;margin:0 0 14px}#box .row{display:flex;gap:8px;flex-wrap:wrap;justify-content:flex-end}
+</style></head><body>
+<header><img id="mascot" alt="Mascotte GIT DRENN"><div><h1>GIT DRENN <span id="ver"></span></h1><small id="cwd"></small></div><div class="hb"><button id="bhelp">Aide</button><button id="babout">À propos</button><button id="quit" title="Arrêter GIT DRENN">Quitter</button></div></header>
+<div id="log"></div>
+<footer>
+<div class="chips" id="chips"></div>
+<form id="f"><input id="in" type="text" maxlength="1000" autocomplete="off" placeholder="Décrivez ce que vous voulez faire… (ex. enregistre mes modifications)" autofocus><button class="primary" id="send">Envoyer</button></form>
+<div class="credit">GIT DRENN — créé par Mr Tantely Orion</div>
+</footer>
+<div id="info"><div id="ibox"><h2 id="ititle"></h2><pre id="itext"></pre><div class="row" style="display:flex;justify-content:flex-end"><button class="primary" id="iclose">Fermer</button></div></div></div>
+<div id="modal"><div id="box"><p id="ptext"></p><div id="pinput"></div><div class="row" id="pbtn"></div></div></div>
+<script>
+const T=new URLSearchParams(location.search).get('t')||'';
+const $=id=>document.getElementById(id);
+const log=$('log');let next=0,shown=0,busy=false;
+$('mascot').src='/mascot.png?t='+encodeURIComponent(T);
+function add(kind,text){const d=document.createElement('div');d.className='ev '+kind;d.textContent=text;log.appendChild(d);log.scrollTop=log.scrollHeight}
+async function api(path,body){const u=path+(path.includes('?')?'&':'?')+'t='+encodeURIComponent(T);
+ const r=await fetch(u,body?{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}:{});
+ return r.json()}
+function setBusy(b){busy=b;$('send').disabled=b;$('in').disabled=b;if(!b)$('in').focus()}
+function btn(label,cls,fn){const b=document.createElement('button');b.textContent=label;if(cls)b.className=cls;b.onclick=fn;return b}
+function answer(id,a){$('modal').style.display='none';shown=id;api('/api/answer',{id:id,answer:a})}
+function showPrompt(p){
+ if(!p){$('modal').style.display='none';return}
+ if(p.id===shown)return;
+ $('ptext').textContent=p.text;const inp=$('pinput'),row=$('pbtn');inp.textContent='';row.textContent='';
+ if(p.kind==='confirm'){row.append(btn('Non',null,()=>answer(p.id,'no')),btn('Oui, continuer','primary',()=>answer(p.id,'yes')))}
+ else if(p.kind==='typed'){const t=document.createElement('input');t.type='text';t.placeholder='Tapez « '+p.word+' »';t.style.cssText='width:100%;margin-bottom:10px;padding:8px;font:inherit';inp.append(t);
+  row.append(btn('Annuler',null,()=>answer(p.id,'')),btn('Confirmer','danger',()=>answer(p.id,t.value)))}
+ else if(p.kind==='choose'){p.options.forEach((o,i)=>row.append(btn((i+1)+'. '+o,null,()=>answer(p.id,String(i)))));row.append(btn('Annuler',null,()=>answer(p.id,'cancel')))}
+ $('modal').style.display='flex'}
+async function poll(){try{const d=await api('/api/events?since='+next);for(const[k,t]of d.events)add(k,t);next=d.next;setBusy(d.running);showPrompt(d.prompt)}catch(e){}setTimeout(poll,350)}
+async function run(text){text=text.trim();if(!text||busy)return;$('in').value='';const r=await api('/api/run',{instruction:text});if(r.error)add('err',r.error)}
+$('f').onsubmit=e=>{e.preventDefault();run($('in').value)};
+$('quit').onclick=()=>{if(confirm('Arrêter GIT DRENN ?')){api('/api/quit',{}).finally(()=>{document.body.textContent='GIT DRENN est arrêté. Vous pouvez fermer cet onglet.'})}};
+['Quel est l\'état du projet ?','Enregistre mes modifications','Montre-moi les modifications','Historique du projet','Mets de côté mes modifications','Complète le gitignore'].forEach(t=>$('chips').append(btn(t,null,()=>run(t))));
+const HELP_TXT=`Écrivez ce que vous voulez faire, avec vos mots. L'agent prépare un plan, vous le montre, puis l'exécute après votre accord.
+
+Exemples :
+• Quel est l'état du projet ?
+• Enregistre mes modifications
+• Crée une branche login
+• Annule mon dernier commit
+• Publie mon projet Blog sur GitHub
+• Clone mastodon dans mon dossier Projets
+• Mets de côté mes modifications
+
+Sécurité : toute action qui envoie des données ou supprime quelque chose demande une confirmation ; les actions critiques demandent de recopier un mot (PUBLIC, FORCER, ABANDONNER). Vos fichiers ne sont jamais envoyés au modèle IA.
+
+Créateur : Mr Tantely Orion`;
+let ABOUT_TXT='GIT DRENN — Git Powered by AI\nCréateur : Mr Tantely Orion';
+function showInfo(t,x){$('ititle').textContent=t;$('itext').textContent=x;$('info').style.display='flex'}
+$('bhelp').onclick=()=>showInfo('Aide',HELP_TXT);
+$('babout').onclick=()=>showInfo('À propos',ABOUT_TXT);
+$('iclose').onclick=()=>{$('info').style.display='none'};
+api('/api/info').then(i=>{$('ver').textContent=i.version;$('cwd').textContent=i.cwd;if(i.about)ABOUT_TXT=i.about});
+add('info','Bonjour ! Décrivez ce que vous voulez faire avec Git. Chaque action importante vous sera demandée avant exécution.');
+poll();
+</script></body></html>

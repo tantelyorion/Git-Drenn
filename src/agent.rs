@@ -230,7 +230,35 @@ impl Agent {
                 }
                 Ok(())
             }
-            CreateBranch { name, .. } | SwitchBranch { name, .. } => {
+            UpdateGitignore { patterns, .. } => {
+                if patterns.len() > 50 {
+                    return Err("trop de règles .gitignore à la fois (50 maximum)".into());
+                }
+                for pat in patterns {
+                    let t = pat.trim();
+                    if t.is_empty() || t.len() > 200 || t.chars().any(|c| c.is_control()) || matches!(t, "*" | "**" | "/" | "!*" | ".") {
+                        return Err(format!("règle .gitignore refusée : « {pat} »"));
+                    }
+                }
+                Ok(())
+            }
+            PushTag { name, remote, .. } => {
+                if let Some(r) = remote {
+                    security::valid_remote_name(r)?;
+                }
+                if name.is_empty() || name.starts_with('-') || name.chars().any(|c| c.is_control() || c.is_whitespace()) {
+                    return Err(format!("nom d'étiquette invalide : « {name} »"));
+                }
+                Ok(())
+            }
+            StashChanges { message: Some(m), .. } => security::valid_commit_message(m),
+            ResolveConflicts { files, strategy, .. } => {
+                if strategy != "ours" && strategy != "theirs" {
+                    return Err("stratégie invalide : « ours » (branche courante) ou « theirs » (branche fusionnée)".into());
+                }
+                rels(files)
+            }
+            CreateBranch { name, .. } | SwitchBranch { name, .. } | MergeBranch { name, .. } | CreateTag { name, .. } => {
                 if name.is_empty() || name.starts_with('-') || name.len() > 100 || name.chars().any(|c| c.is_control() || c.is_whitespace()) {
                     Err(format!("nom de branche invalide : « {name} »"))
                 } else {
@@ -239,6 +267,7 @@ impl Agent {
             }
             StageChanges { files, .. } | DiscardChanges { files, .. } => rels(files),
             CreateCommit { message, .. } => if message.trim().is_empty() { Ok(()) } else { security::valid_commit_message(message) },
+            // (message d'étiquette validé à l'exécution)
             ConfigureRemote { name, url, .. } => {
                 if let Some(n) = name {
                     security::valid_remote_name(n)?;
@@ -413,6 +442,17 @@ impl Agent {
             }
             ConfigureRemote { path, name, url } => self.configure_remote(path, name, url),
             DiscardChanges { path, files } => self.discard(path, files),
+            UpdateGitignore { path, patterns } => self.update_gitignore(path, patterns),
+            UndoLastCommit { path } => self.undo_last_commit(path),
+            MergeBranch { path, name, keep_conflicts } => self.merge_branch(path, name, *keep_conflicts),
+            InspectConflicts { path } => self.inspect_conflicts(path),
+            ResolveConflicts { path, files, strategy } => self.resolve_conflicts(path, files, strategy),
+            AbortMerge { path } => self.abort_merge(path),
+            ContinueMerge { path } => self.continue_merge(path),
+            CreateTag { path, name, message } => self.create_tag(path, name, message),
+            PushTag { path, name, remote } => self.push_tag(path, name, remote),
+            StashChanges { path, message } => self.stash(path, message),
+            RestoreStash { path } => self.restore_stash(path),
             ListRemoteRepositories {} => {
                 let repos = self.gh.list_repos()?;
                 Ok(format!("Vos dépôts GitHub (30 derniers modifiés) :\n{}", repos.iter().map(fmt_repo).collect::<Vec<_>>().join("\n")))
@@ -728,7 +768,7 @@ impl Agent {
             for (p, r) in skipped.iter().take(10) {
                 s += &format!("\n    - {p} ({r})");
             }
-            s += "\n  Ajoutez-les à .gitignore s'ils ne doivent jamais être publiés.";
+            s += "\n  Dites « complète le gitignore » pour qu'ils ne soient plus proposés.";
         }
         Ok(s)
     }
@@ -930,6 +970,359 @@ impl Agent {
         Ok(s)
     }
 
+    // ---- v0.2 : .gitignore, annulation de commit, fusion, étiquettes
+
+    fn update_gitignore(&self, path: &Option<String>, patterns: &[String]) -> Res<String> {
+        let repo = self.resolve_repo(path)?;
+        let wanted: Vec<String> = if patterns.is_empty() { default_ignore_rules(&repo) } else { patterns.iter().map(|p| p.trim().to_string()).collect() };
+        let file = repo.join(".gitignore");
+        let existing = std::fs::read_to_string(&file).unwrap_or_default();
+        let have: BTreeSet<&str> = existing.lines().map(str::trim).collect();
+        let missing: Vec<&String> = wanted.iter().filter(|w| !have.contains(w.as_str())).collect();
+        if missing.is_empty() {
+            return Ok("Le .gitignore contient déjà toutes ces règles : rien à ajouter.".into());
+        }
+        let mut content = existing.clone();
+        if !content.is_empty() && !content.ends_with('\n') {
+            content.push('\n');
+        }
+        if !content.is_empty() {
+            content.push('\n');
+        }
+        content.push_str("# Ajouté par GIT DRENN\n");
+        for m in &missing {
+            content.push_str(m);
+            content.push('\n');
+        }
+        std::fs::write(&file, &content).map_err(|e| format!("écriture du .gitignore impossible : {e}"))?;
+        // Vérification : relecture, et fichiers déjà suivis que la règle ne peut pas retirer.
+        let back = std::fs::read_to_string(&file).map_err(|e| e.to_string())?;
+        if missing.iter().any(|m| !back.lines().any(|l| l.trim() == m.as_str())) {
+            return Err("le .gitignore n'a pas été écrit correctement".into());
+        }
+        let tracked = self.git.out(&repo, &["ls-files", "-i", "-c", "--exclude-standard", "-z"], Kind::Local).unwrap_or_default();
+        let tracked: Vec<&str> = tracked.split('\0').filter(|s| !s.is_empty()).collect();
+        let mut s = format!(".gitignore mis à jour : {} règle(s) ajoutée(s) ({}).", missing.len(), list_names(missing.iter().map(|m| m.as_str()), 8));
+        if !tracked.is_empty() {
+            s += &format!(
+                "\n  Attention : {} fichier(s) déjà suivi(s) par Git restent suivis ({}). Pour les retirer sans les supprimer : git rm --cached <fichier>. S'ils contiennent des secrets, changez-les.",
+                tracked.len(), list_names(tracked.iter().cloned(), 5)
+            );
+        }
+        Ok(s)
+    }
+
+    fn undo_last_commit(&self, path: &Option<String>) -> Res<String> {
+        let repo = self.resolve_repo(path)?;
+        let head = self.git.head(&repo).ok_or("aucun commit à annuler")?;
+        let parent = self
+            .git
+            .line(&repo, &["rev-parse", "--verify", "-q", "HEAD~1"])
+            .map_err(|_| "c'est le tout premier commit : il ne peut pas être annulé de cette façon".to_string())?;
+        if self.git.run(&repo, &["rev-parse", "--verify", "-q", "HEAD^2"], Kind::Local)?.ok() {
+            return Err("le dernier commit est une fusion : annulation automatique refusée".into());
+        }
+        let pushed = self.git.line(&repo, &["branch", "-r", "--contains", &head]).unwrap_or_default();
+        if !pushed.is_empty() {
+            return Err(format!(
+                "ce commit est déjà présent sur le dépôt distant ({}) : l'annuler obligerait à réécrire l'historique partagé. GIT DRENN ne le fait pas automatiquement.",
+                pushed.lines().next().unwrap_or("").trim()
+            ));
+        }
+        let subj = self.git.line(&repo, &["log", "-1", "--format=%s"]).unwrap_or_default();
+        // Filet de sécurité : l'ancien commit reste référencé.
+        let backup = format!("refs/drenn/backup/commit-{}", now_secs());
+        self.git.out(&repo, &["update-ref", &backup, &head], Kind::Local)?;
+        self.git.out(&repo, &["reset", "--soft", "HEAD~1"], Kind::Local)?;
+        if self.git.head(&repo).as_deref() != Some(parent.as_str()) {
+            return Err("l'annulation n'a pas été vérifiée : HEAD n'est pas revenu au commit précédent".into());
+        }
+        let n = self.staged_names(&repo)?.len();
+        Ok(format!(
+            "Commit {} « {} » annulé. Ses {n} fichier(s) restent préparés : rien n'est perdu.\n  Pour le retrouver tel quel : git reset --soft {}",
+            short(&head), subj, short(&head)
+        ))
+    }
+
+    fn merge_branch(&self, path: &Option<String>, name: &str, keep_conflicts: bool) -> Res<String> {
+        let repo = self.resolve_repo(path)?;
+        self.check_branch_name(&repo, name)?;
+        if !self.branch_exists(&repo, name) {
+            return Err(format!("la branche « {name} » n'existe pas"));
+        }
+        let current = self.git.branch(&repo).ok_or("aucune branche courante : fusion impossible")?;
+        if current == name {
+            return Err("on ne peut pas fusionner une branche dans elle-même".into());
+        }
+        let entries = self.git.status(&repo)?;
+        if entries.iter().any(|e| !e.untracked()) {
+            return Err("des modifications non enregistrées existent : enregistrez-les (ou abandonnez-les) avant de fusionner".into());
+        }
+        let before = self.git.head(&repo).ok_or("aucun commit sur la branche courante")?;
+        let o = self.git.run(&repo, &["merge", "--no-edit", name], Kind::Local)?;
+        if !o.ok() {
+            let conflicts: Vec<String> = self.git.status(&repo)?.into_iter().filter(|e| e.conflicted()).map(|e| e.path).collect();
+            if !conflicts.is_empty() && keep_conflicts {
+                return Ok(format!(
+                    "Fusion de « {name} » en conflit sur {} fichier(s) : {}.\n  La fusion est EN COURS. Dites « montre les conflits », puis « résous les conflits en gardant ma version » (ou « la version distante »), puis « termine la fusion » — ou « annule la fusion ».",
+                    conflicts.len(), list_names(conflicts.iter().map(|s| s.as_str()), 8)
+                ));
+            }
+            if !conflicts.is_empty() {
+                let _ = self.git.run(&repo, &["merge", "--abort"], Kind::Local);
+                let restored = self.git.head(&repo).as_deref() == Some(before.as_str()) && self.git.status(&repo)?.iter().all(|e| !e.conflicted());
+                return Err(format!(
+                    "conflit de fusion dans : {}. La fusion a été annulée automatiquement{} — résolvez ces fichiers à la main ou fusionnez dans l'autre sens.",
+                    list_names(conflicts.iter().map(|s| s.as_str()), 8),
+                    if restored { " et votre branche est intacte" } else { " MAIS l'état n'a pas pu être vérifié : vérifiez avec « état du projet »" }
+                ));
+            }
+            return Err(o.err_text());
+        }
+        if !self.git.run(&repo, &["merge-base", "--is-ancestor", name, "HEAD"], Kind::Local)?.ok() {
+            return Err("la fusion n'a pas été vérifiée : la branche n'est pas incluse dans HEAD".into());
+        }
+        let after = self.git.head(&repo).unwrap_or_default();
+        Ok(if after == before {
+            format!("« {name} » était déjà intégrée dans « {current} » : rien à fusionner.")
+        } else {
+            format!("« {name} » fusionnée dans « {current} » (nouveau commit {}).", short(&after))
+        })
+    }
+
+    fn create_tag(&self, path: &Option<String>, name: &str, message: &Option<String>) -> Res<String> {
+        let repo = self.resolve_repo(path)?;
+        let tag_ref = format!("refs/tags/{name}");
+        if !self.git.run(&repo, &["check-ref-format", &tag_ref], Kind::Local)?.ok() {
+            return Err(format!("nom d'étiquette invalide : « {name} »"));
+        }
+        let head = self.git.head(&repo).ok_or("aucun commit à étiqueter")?;
+        if self.git.run(&repo, &["rev-parse", "--verify", "-q", &tag_ref], Kind::Local)?.ok() {
+            return Err(format!("l'étiquette « {name} » existe déjà"));
+        }
+        let msg = match message.as_deref().map(str::trim).filter(|m| !m.is_empty()) {
+            Some(m) => {
+                security::valid_commit_message(m)?;
+                m.to_string()
+            }
+            None => format!("Version {name}"),
+        };
+        self.git.out(&repo, &["tag", "-a", name, "-m", &msg], Kind::Local)?;
+        let tagged = self.git.line(&repo, &["rev-parse", &format!("{tag_ref}^{{commit}}")])?;
+        if tagged != head {
+            return Err("l'étiquette ne pointe pas sur le dernier commit".into());
+        }
+        Ok(format!("Étiquette « {name} » créée sur le commit {} (locale : elle n'est pas envoyée au dépôt distant).", short(&head)))
+    }
+
+    fn push_tag(&self, path: &Option<String>, name: &str, remote: &Option<String>) -> Res<String> {
+        let repo = self.resolve_repo(path)?;
+        let (r, url) = self.remote_for(&repo, remote)?;
+        let tag_ref = format!("refs/tags/{name}");
+        let local = self
+            .git
+            .line(&repo, &["rev-parse", "--verify", "-q", &tag_ref])
+            .map_err(|_| format!("l'étiquette « {name} » n'existe pas localement (créez-la d'abord)"))?;
+        let remote_hash = |g: &Git| -> Res<Option<String>> {
+            let o = g.out(&repo, &["ls-remote", "--tags", &r, &tag_ref], Kind::Net)?;
+            Ok(o.lines().next().and_then(|l| l.split_whitespace().next()).map(|s| s.to_string()))
+        };
+        if let Some(h) = remote_hash(&self.git)? {
+            return if h == local {
+                Ok(format!("L'étiquette « {name} » est déjà sur « {r} » : rien à envoyer."))
+            } else {
+                Err(format!("« {r} » possède déjà une étiquette « {name} » différente : GIT DRENN ne la remplace jamais."))
+            };
+        }
+        ui::say(format!("  Destination : {r} → {url}\n  Étiquette : {name}"));
+        if !self.ask("Confirmer l'envoi de l'étiquette ?") {
+            return Err("envoi annulé par l'utilisateur".into());
+        }
+        let spec = format!("{tag_ref}:{tag_ref}");
+        self.git.out(&repo, &["push", &r, &spec], Kind::Net)?;
+        match remote_hash(&self.git)? {
+            Some(h) if h == local => Ok(format!("Vérifié : l'étiquette « {name} » est présente sur « {r} ».")),
+            _ => Err("l'envoi n'a pas pu être vérifié : l'étiquette est absente ou différente côté distant".into()),
+        }
+    }
+
+    fn stash_count(&self, repo: &Path) -> usize {
+        self.git.line(repo, &["stash", "list"]).map(|s| s.lines().count()).unwrap_or(0)
+    }
+
+    fn stash(&self, path: &Option<String>, message: &Option<String>) -> Res<String> {
+        let repo = self.resolve_repo(path)?;
+        let entries = self.git.status(&repo)?;
+        if entries.is_empty() {
+            return Ok("Aucune modification à mettre de côté.".into());
+        }
+        if self.git.head(&repo).is_none() {
+            return Err("aucun commit : impossible de mettre de côté (enregistrez d'abord un premier commit)".into());
+        }
+        let before = self.stash_count(&repo);
+        let msg = message.as_deref().map(str::trim).filter(|m| !m.is_empty()).map(|m| m.to_string()).unwrap_or_else(|| format!("GIT DRENN {}", now_secs()));
+        self.git.out(&repo, &["stash", "push", "-u", "-m", &msg], Kind::Local)?;
+        let left = self.git.status(&repo)?;
+        if self.stash_count(&repo) != before + 1 || !left.is_empty() {
+            return Err("la mise de côté n'a pas été vérifiée : le dossier n'est pas propre ou la réserve n'a pas été créée".into());
+        }
+        Ok(format!("{} fichier(s) mis de côté (« {msg} »). Dossier propre ; dites « remets mes modifications mises de côté » pour les retrouver.", entries.len()))
+    }
+
+    fn restore_stash(&self, path: &Option<String>) -> Res<String> {
+        let repo = self.resolve_repo(path)?;
+        if self.stash_count(&repo) == 0 {
+            return Err("aucune modification mise de côté".into());
+        }
+        if self.git.status(&repo)?.iter().any(|e| !e.untracked()) {
+            return Err("des modifications en cours existent : enregistrez-les ou mettez-les de côté avant de remettre les anciennes".into());
+        }
+        let before = self.stash_count(&repo);
+        let o = self.git.run(&repo, &["stash", "pop"], Kind::Local)?;
+        if !o.ok() {
+            if self.git.status(&repo)?.iter().any(|e| e.conflicted()) {
+                // L'arbre suivi était propre avant : revenir à HEAD ne perd rien ; la réserve est conservée par Git.
+                let _ = self.git.run(&repo, &["reset", "--hard", "HEAD"], Kind::Local);
+                return Err("conflit en remettant les modifications : opération annulée, vos modifications restent en sécurité dans la réserve (git stash list)".into());
+            }
+            return Err(o.err_text());
+        }
+        if self.stash_count(&repo) + 1 != before {
+            return Err("la remise en place n'a pas été vérifiée".into());
+        }
+        Ok(format!("Modifications remises en place ({} fichier(s) concerné(s)).", self.git.status(&repo)?.len()))
+    }
+
+    // ---- v0.3 : conflits de fusion
+
+    fn merging(&self, repo: &Path) -> bool {
+        self.git.run(repo, &["rev-parse", "-q", "--verify", "MERGE_HEAD"], Kind::Local).map(|o| o.ok()).unwrap_or(false)
+    }
+
+    fn inspect_conflicts(&self, path: &Option<String>) -> Res<String> {
+        let repo = self.resolve_repo(path)?;
+        let conflicts: Vec<Entry> = self.git.status(&repo)?.into_iter().filter(|e| e.conflicted()).collect();
+        if conflicts.is_empty() {
+            return Ok(if self.merging(&repo) {
+                "Aucun conflit restant : la fusion est en cours, dites « termine la fusion ».".into()
+            } else {
+                "Aucun conflit.".into()
+            });
+        }
+        let mut s = format!("{} fichier(s) en conflit{} :\n", conflicts.len(), if self.merging(&repo) { " (fusion en cours)" } else { "" });
+        for e in &conflicts {
+            let what = match (e.x, e.y) {
+                ('U', 'U') => "modifié des deux côtés".to_string(),
+                ('A', 'A') => "ajouté des deux côtés".to_string(),
+                ('D', 'U') => "supprimé sur la branche courante, modifié sur l'autre".to_string(),
+                ('U', 'D') => "modifié sur la branche courante, supprimé sur l'autre".to_string(),
+                ('A', 'U') => "ajouté sur la branche courante seulement".to_string(),
+                ('U', 'A') => "ajouté sur l'autre branche seulement".to_string(),
+                ('D', 'D') => "supprimé des deux côtés".to_string(),
+                _ => "conflit".to_string(),
+            };
+            let hunks = std::fs::read_to_string(repo.join(&e.path)).map(|t| t.lines().filter(|l| l.starts_with("<<<<<<<")).count()).unwrap_or(0);
+            s += &format!("  - {} : {what}{}\n", e.path, if hunks > 0 { format!(" ({hunks} zone(s) à arbitrer)") } else { String::new() });
+        }
+        s += "  Choisissez : « résous les conflits en gardant ma version » (branche courante) ou « … la version distante » (branche fusionnée), ou « annule la fusion ».";
+        Ok(s)
+    }
+
+    fn resolve_conflicts(&self, path: &Option<String>, files: &[String], strategy: &str) -> Res<String> {
+        let repo = self.resolve_repo(path)?;
+        let fl: Vec<String> = files.iter().map(|f| norm_rel(f)).collect();
+        let targets: Vec<Entry> = self
+            .git
+            .status(&repo)?
+            .into_iter()
+            .filter(|e| e.conflicted() && (fl.is_empty() || fl.iter().any(|f| *f == e.path)))
+            .collect();
+        if targets.is_empty() {
+            return Err("aucun fichier en conflit correspondant".into());
+        }
+        let side = if strategy == "ours" { "ours" } else { "theirs" };
+        let label = if side == "ours" { "de la branche COURANTE" } else { "de la branche FUSIONNÉE" };
+        ui::say(format!("  {} fichier(s) : {}\n  Pour chacun, la version {label} sera gardée ; l'autre sera écartée.", targets.len(), list_names(targets.iter().map(|e| e.path.as_str()), 8)));
+        if !self.ask("Confirmer cette résolution ?") {
+            return Err("résolution annulée par l'utilisateur".into());
+        }
+        // Sauvegarde des fichiers (avec marqueurs de conflit) dans .git, hors de tout commit.
+        let bdir = repo.join(".git").join("drenn-backup").join(now_secs().to_string());
+        std::fs::create_dir_all(&bdir).map_err(|e| format!("sauvegarde impossible, résolution annulée : {e}"))?;
+        for e in &targets {
+            let src = repo.join(&e.path);
+            if src.is_file() {
+                let flat = e.path.replace(['/', '\\'], "__");
+                std::fs::copy(&src, bdir.join(flat)).map_err(|er| format!("sauvegarde impossible, résolution annulée : {er}"))?;
+            }
+        }
+        for e in &targets {
+            let side_exists = match (e.x, e.y, side) {
+                ('U', 'U', _) | ('A', 'A', _) => true,
+                ('D', 'U', "ours") | ('U', 'A', "ours") | ('D', 'D', _) => false,
+                ('U', 'D', "theirs") | ('A', 'U', "theirs") => false,
+                _ => true,
+            };
+            if side_exists {
+                let flag = format!("--{side}");
+                self.git.out(&repo, &["checkout", &flag, "--", &e.path], Kind::Local)?;
+                self.git.out(&repo, &["add", "--", &e.path], Kind::Local)?;
+            } else {
+                self.git.out(&repo, &["rm", "-q", "--", &e.path], Kind::Local)?;
+            }
+        }
+        let still: Vec<String> = self.git.status(&repo)?.into_iter().filter(|e| e.conflicted() && targets.iter().any(|t| t.path == e.path)).map(|e| e.path).collect();
+        if !still.is_empty() {
+            return Err(format!("{} fichier(s) restent en conflit : {}", still.len(), list_names(still.iter().map(|s| s.as_str()), 5)));
+        }
+        let left = self.git.status(&repo)?.iter().filter(|e| e.conflicted()).count();
+        Ok(format!(
+            "{} conflit(s) résolu(s) en gardant la version {label}. Sauvegarde des fichiers d'origine : {}\n  {}",
+            targets.len(),
+            bdir.display(),
+            if left > 0 { format!("Il reste {left} fichier(s) en conflit.") } else { "Plus aucun conflit : dites « termine la fusion ».".to_string() }
+        ))
+    }
+
+    fn abort_merge(&self, path: &Option<String>) -> Res<String> {
+        let repo = self.resolve_repo(path)?;
+        if !self.merging(&repo) {
+            return Err("aucune fusion en cours".into());
+        }
+        self.git.out(&repo, &["merge", "--abort"], Kind::Local)?;
+        if self.merging(&repo) || self.git.status(&repo)?.iter().any(|e| e.conflicted()) {
+            return Err("l'annulation n'a pas été vérifiée : la fusion semble encore en cours".into());
+        }
+        Ok("Fusion annulée : votre branche est revenue exactement à son état d'avant.".into())
+    }
+
+    fn continue_merge(&self, path: &Option<String>) -> Res<String> {
+        let repo = self.resolve_repo(path)?;
+        if !self.merging(&repo) {
+            return Err("aucune fusion en cours".into());
+        }
+        let left: Vec<String> = self.git.status(&repo)?.into_iter().filter(|e| e.conflicted()).map(|e| e.path).collect();
+        if !left.is_empty() {
+            return Err(format!("{} fichier(s) sont encore en conflit : {}", left.len(), list_names(left.iter().map(|s| s.as_str()), 5)));
+        }
+        let staged = self.staged_names(&repo)?;
+        let found: Vec<String> = staged
+            .iter()
+            .enumerate()
+            .filter_map(|(i, f)| security::check_file(&repo.join(f), f, self.cfg.max_file_size_mb, i < 3000).map(|r| format!("{f} ({r})")))
+            .collect();
+        if !found.is_empty() {
+            return Err(format!("fusion non terminée : fichiers sensibles dans l'index :\n    - {}", found.join("\n    - ")));
+        }
+        let before = self.git.head(&repo);
+        self.git.out(&repo, &["commit", "--no-edit"], Kind::Local)?;
+        let after = self.git.head(&repo);
+        if after == before || self.merging(&repo) {
+            return Err("le commit de fusion n'a pas été créé".into());
+        }
+        Ok(format!("Fusion terminée : commit {}.", short(&after.unwrap_or_default())))
+    }
+
     // ---- abandon de modifications (destructif, avec sauvegarde de secours)
 
     fn discard(&self, path: &Option<String>, files: &[String]) -> Res<String> {
@@ -989,6 +1382,32 @@ impl Agent {
         }
         Ok(s)
     }
+}
+
+/// Règles .gitignore proposées selon le type de projet détecté (toujours : secrets et fichiers système).
+fn default_ignore_rules(repo: &Path) -> Vec<String> {
+    let mut r: Vec<&str> = vec![".env", ".env.*", "!.env.example", "*.pem", "*.key", "id_rsa", "id_ed25519", ".DS_Store", "Thumbs.db"];
+    let has = |f: &str| repo.join(f).exists();
+    if has("package.json") {
+        r.extend(["node_modules/", "dist/", "npm-debug.log*"]);
+    }
+    if has("composer.json") || has("index.php") {
+        r.extend(["vendor/", "*.log"]);
+    }
+    if has("Cargo.toml") {
+        r.push("target/");
+    }
+    if has("requirements.txt") || has("pyproject.toml") {
+        r.extend(["__pycache__/", "*.pyc", ".venv/"]);
+    }
+    if has("pom.xml") {
+        r.push("target/");
+    }
+    if has("go.mod") {
+        r.push("bin/");
+    }
+    let mut seen = BTreeSet::new();
+    r.into_iter().filter(|x| seen.insert(*x)).map(|s| s.to_string()).collect()
 }
 
 // ---------------------------------------------------------------- présentation
@@ -1172,5 +1591,200 @@ mod tests {
         assert!(r.contains("stash apply"), "{r}");
         assert_eq!(std::fs::read_to_string(p.join("a.txt")).unwrap(), "v1");
         assert!(p.join("n.txt").exists());
+    }
+}
+
+#[cfg(test)]
+mod tests_v02 {
+    use super::*;
+    use serde_json::json;
+
+    fn setup(name: &str) -> (Agent, PathBuf, PathBuf) {
+        let base = std::env::temp_dir().join(format!("drenn_v2_{name}_{}", now_secs()));
+        let _ = std::fs::remove_dir_all(&base);
+        let p = base.join("proj");
+        std::fs::create_dir_all(&p).unwrap();
+        let cfg = Config { allowed_roots: vec![base.to_string_lossy().to_string()], ..Config::default() };
+        let mut a = Agent::new(cfg, base.clone(), None).unwrap();
+        a.test_yes = true;
+        for args in [vec!["init", "-q", "-b", "main"], vec!["config", "user.name", "T"], vec!["config", "user.email", "t@t.t"]] {
+            a.git.out(&p, &args, Kind::Local).unwrap();
+        }
+        (a, base, p)
+    }
+    fn go(a: &Agent, v: serde_json::Value) -> Res<String> {
+        a.exec(&serde_json::from_value::<Action>(v).unwrap())
+    }
+    fn commit_file(a: &Agent, p: &Path, f: &str, c: &str, msg: &str) {
+        std::fs::write(p.join(f), c).unwrap();
+        go(a, json!({"action":"stage_changes","path":"proj"})).unwrap();
+        go(a, json!({"action":"create_commit","path":"proj","message":msg})).unwrap();
+    }
+
+    #[test]
+    fn gitignore_defaut_et_idempotent() {
+        let (a, _b, p) = setup("ign");
+        std::fs::write(p.join("package.json"), "{}").unwrap();
+        let r = go(&a, json!({"action":"update_gitignore","path":"proj"})).unwrap();
+        assert!(r.contains("mis à jour"), "{r}");
+        let g = std::fs::read_to_string(p.join(".gitignore")).unwrap();
+        assert!(g.contains(".env") && g.contains("node_modules/"));
+        assert!(go(&a, json!({"action":"update_gitignore","path":"proj"})).unwrap().contains("rien à ajouter"));
+        assert!(go(&a, json!({"action":"update_gitignore","path":"proj","patterns":["*"]})).is_err());
+        // les secrets ignorés ne sont plus proposés au stage
+        std::fs::write(p.join(".env"), "A=1").unwrap();
+        let r = go(&a, json!({"action":"stage_changes","path":"proj"})).unwrap();
+        assert!(!r.contains("EXCLU"), "{r}");
+    }
+
+    #[test]
+    fn annulation_du_dernier_commit() {
+        let (a, base, p) = setup("undo");
+        commit_file(&a, &p, "a.txt", "1", "un");
+        commit_file(&a, &p, "b.txt", "2", "deux");
+        let first = a.git.line(&p, &["rev-parse", "HEAD~1"]).unwrap();
+        let r = go(&a, json!({"action":"undo_last_commit","path":"proj"})).unwrap();
+        assert!(r.contains("annulé"), "{r}");
+        assert_eq!(a.git.head(&p).unwrap(), first);
+        assert!(p.join("b.txt").exists());
+        assert_eq!(a.staged_names(&p).unwrap(), vec!["b.txt".to_string()]);
+        // Un commit déjà envoyé n'est jamais annulé.
+        go(&a, json!({"action":"create_commit","path":"proj","message":"deux"})).unwrap();
+        let bare = base.join("r.git");
+        a.git.out(&base, &["init", "-q", "--bare", bare.to_str().unwrap()], Kind::Local).unwrap();
+        a.git.out(&p, &["remote", "add", "origin", bare.to_str().unwrap()], Kind::Local).unwrap();
+        go(&a, json!({"action":"push_changes","path":"proj"})).unwrap();
+        let e = go(&a, json!({"action":"undo_last_commit","path":"proj"})).unwrap_err();
+        assert!(e.contains("déjà présent"), "{e}");
+    }
+
+    #[test]
+    fn fusion_et_conflit_annule_proprement() {
+        let (a, _b, p) = setup("merge");
+        commit_file(&a, &p, "a.txt", "base\n", "base");
+        go(&a, json!({"action":"create_branch","path":"proj","name":"dev"})).unwrap();
+        commit_file(&a, &p, "d.txt", "dev\n", "dev");
+        go(&a, json!({"action":"switch_branch","path":"proj","name":"main"})).unwrap();
+        let r = go(&a, json!({"action":"merge_branch","path":"proj","name":"dev"})).unwrap();
+        assert!(r.contains("fusionnée"), "{r}");
+        assert!(p.join("d.txt").exists());
+        // conflit
+        go(&a, json!({"action":"create_branch","path":"proj","name":"x"})).unwrap();
+        commit_file(&a, &p, "a.txt", "X\n", "x");
+        go(&a, json!({"action":"switch_branch","path":"proj","name":"main"})).unwrap();
+        commit_file(&a, &p, "a.txt", "MAIN\n", "main");
+        let head = a.git.head(&p).unwrap();
+        let e = go(&a, json!({"action":"merge_branch","path":"proj","name":"x"})).unwrap_err();
+        assert!(e.contains("conflit") && e.contains("intacte"), "{e}");
+        assert_eq!(a.git.head(&p).unwrap(), head);
+        assert_eq!(std::fs::read_to_string(p.join("a.txt")).unwrap(), "MAIN\n");
+        // modifications non enregistrées : refus
+        std::fs::write(p.join("a.txt"), "sale").unwrap();
+        assert!(go(&a, json!({"action":"merge_branch","path":"proj","name":"dev"})).unwrap_err().contains("non enregistrées"));
+    }
+
+    fn conflict_repo(name: &str) -> (Agent, PathBuf) {
+        let (a, _b, p) = setup(name);
+        commit_file(&a, &p, "a.txt", "base\n", "base");
+        go(&a, json!({"action":"create_branch","path":"proj","name":"x"})).unwrap();
+        commit_file(&a, &p, "a.txt", "X\n", "x");
+        go(&a, json!({"action":"switch_branch","path":"proj","name":"main"})).unwrap();
+        commit_file(&a, &p, "a.txt", "MAIN\n", "main");
+        (a, p)
+    }
+
+    #[test]
+    fn conflits_garder_ma_version_puis_terminer() {
+        let (a, p) = conflict_repo("cf1");
+        let r = go(&a, json!({"action":"merge_branch","path":"proj","name":"x","keep_conflicts":true})).unwrap();
+        assert!(r.contains("EN COURS"), "{r}");
+        let r = go(&a, json!({"action":"inspect_conflicts","path":"proj"})).unwrap();
+        assert!(r.contains("a.txt") && r.contains("zone"), "{r}");
+        assert!(go(&a, json!({"action":"continue_merge","path":"proj"})).unwrap_err().contains("conflit"));
+        let r = go(&a, json!({"action":"resolve_conflicts","path":"proj","strategy":"ours"})).unwrap();
+        assert!(r.contains("Sauvegarde"), "{r}");
+        assert_eq!(std::fs::read_to_string(p.join("a.txt")).unwrap(), "MAIN\n");
+        assert!(p.join(".git").join("drenn-backup").is_dir());
+        let r = go(&a, json!({"action":"continue_merge","path":"proj"})).unwrap();
+        assert!(r.contains("terminée"), "{r}");
+        assert!(!a.merging(&p));
+        assert!(a.git.line(&p, &["rev-parse", "--verify", "-q", "HEAD^2"]).is_ok());
+    }
+
+    #[test]
+    fn conflits_version_fusionnee_et_annulation() {
+        let (a, p) = conflict_repo("cf2");
+        go(&a, json!({"action":"merge_branch","path":"proj","name":"x","keep_conflicts":true})).unwrap();
+        go(&a, json!({"action":"resolve_conflicts","path":"proj","strategy":"theirs"})).unwrap();
+        assert_eq!(std::fs::read_to_string(p.join("a.txt")).unwrap(), "X\n");
+        let head = a.git.head(&p).unwrap();
+        go(&a, json!({"action":"abort_merge","path":"proj"})).unwrap();
+        assert_eq!(a.git.head(&p).unwrap(), head);
+        assert_eq!(std::fs::read_to_string(p.join("a.txt")).unwrap(), "MAIN\n");
+        assert!(go(&a, json!({"action":"abort_merge","path":"proj"})).is_err());
+        assert!(go(&a, json!({"action":"resolve_conflicts","path":"proj","strategy":"nimporte"})).is_err());
+    }
+
+    #[test]
+    fn conflit_suppression_contre_modification() {
+        let (a, _b, p) = setup("cf3");
+        commit_file(&a, &p, "a.txt", "base\n", "base");
+        commit_file(&a, &p, "b.txt", "b\n", "b");
+        go(&a, json!({"action":"create_branch","path":"proj","name":"x"})).unwrap();
+        a.git.out(&p, &["rm", "-q", "a.txt"], Kind::Local).unwrap();
+        go(&a, json!({"action":"create_commit","path":"proj","message":"suppr"})).unwrap();
+        go(&a, json!({"action":"switch_branch","path":"proj","name":"main"})).unwrap();
+        commit_file(&a, &p, "a.txt", "modifie\n", "modif");
+        go(&a, json!({"action":"merge_branch","path":"proj","name":"x","keep_conflicts":true})).unwrap();
+        assert!(go(&a, json!({"action":"inspect_conflicts","path":"proj"})).unwrap().contains("supprimé"));
+        go(&a, json!({"action":"resolve_conflicts","path":"proj","strategy":"theirs"})).unwrap();
+        assert!(!p.join("a.txt").exists());
+        go(&a, json!({"action":"continue_merge","path":"proj"})).unwrap();
+    }
+
+    #[test]
+    fn etiquette_distante() {
+        let (a, base, p) = setup("tagpush");
+        commit_file(&a, &p, "a.txt", "1", "un");
+        let bare = base.join("r.git");
+        a.git.out(&base, &["init", "-q", "--bare", bare.to_str().unwrap()], Kind::Local).unwrap();
+        a.git.out(&p, &["remote", "add", "origin", bare.to_str().unwrap()], Kind::Local).unwrap();
+        assert!(go(&a, json!({"action":"push_tag","path":"proj","name":"v1"})).unwrap_err().contains("n'existe pas"));
+        go(&a, json!({"action":"create_tag","path":"proj","name":"v1"})).unwrap();
+        let r = go(&a, json!({"action":"push_tag","path":"proj","name":"v1"})).unwrap();
+        assert!(r.contains("Vérifié"), "{r}");
+        assert!(go(&a, json!({"action":"push_tag","path":"proj","name":"v1"})).unwrap().contains("déjà"));
+    }
+
+    #[test]
+    fn mise_de_cote_et_retour() {
+        let (a, _b, p) = setup("stash");
+        commit_file(&a, &p, "a.txt", "v1", "un");
+        assert!(go(&a, json!({"action":"stash_changes","path":"proj"})).unwrap().contains("Aucune"));
+        std::fs::write(p.join("a.txt"), "v2").unwrap();
+        std::fs::write(p.join("n.txt"), "neuf").unwrap();
+        let r = go(&a, json!({"action":"stash_changes","path":"proj","message":"pause"})).unwrap();
+        assert!(r.contains("mis(es) de côté") || r.contains("mis de côté"), "{r}");
+        assert_eq!(std::fs::read_to_string(p.join("a.txt")).unwrap(), "v1");
+        assert!(!p.join("n.txt").exists());
+        // un travail en cours bloque la remise en place
+        std::fs::write(p.join("a.txt"), "autre").unwrap();
+        assert!(go(&a, json!({"action":"restore_stash","path":"proj"})).unwrap_err().contains("en cours"));
+        go(&a, json!({"action":"discard_changes","path":"proj"})).unwrap();
+        go(&a, json!({"action":"restore_stash","path":"proj"})).unwrap();
+        assert_eq!(std::fs::read_to_string(p.join("a.txt")).unwrap(), "v2");
+        assert!(p.join("n.txt").exists());
+        assert!(go(&a, json!({"action":"restore_stash","path":"proj"})).is_err());
+    }
+
+    #[test]
+    fn etiquette() {
+        let (a, _b, p) = setup("tag");
+        commit_file(&a, &p, "a.txt", "1", "un");
+        let r = go(&a, json!({"action":"create_tag","path":"proj","name":"v1.0.0","message":"Première version"})).unwrap();
+        assert!(r.contains("v1.0.0"), "{r}");
+        assert!(go(&a, json!({"action":"create_tag","path":"proj","name":"v1.0.0"})).unwrap_err().contains("existe déjà"));
+        assert!(go(&a, json!({"action":"create_tag","path":"proj","name":"a b"})).is_err());
+        assert!(go(&a, json!({"action":"create_tag","path":"proj","name":"-x"})).is_err());
     }
 }

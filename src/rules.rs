@@ -136,16 +136,53 @@ struct Ctx<'a> {
     project: Option<String>,
     message: Option<String>,
     public: bool,
+    keep_conflicts: bool,
 }
 
 fn clause(c: &[Tok], x: &Ctx) -> Result<Vec<Action>, String> {
     let path = project_name(c).or_else(|| x.project.clone());
     let q = |s: &str| Err(s.to_string());
 
+    // 0a. Fusion en cours : conflits, résolution, fin, annulation
+    if has(c, &["fusion", "merge"]) && has(c, &["termin", "finalis", "continu", "conclu", "valide"]) && !has(c, &["conflit"]) {
+        return Ok(vec![Action::ContinueMerge { path }]);
+    }
+    if has(c, &["fusion", "merge"]) && has(c, &["annul", "abandon", "abort", "stoppe", "arrete"]) {
+        return Ok(vec![Action::AbortMerge { path }]);
+    }
+    if has(c, &["conflit"]) {
+        if has(c, &["reso", "resol", "regle", "corrige", "resolve", "fix"]) {
+            let ours = has(c, &["ma=", "mienne", "miennes", "courante", "locale", "ours=", "moi=", "mon=", "my=", "mine="]);
+            let theirs = has(c, &["leur", "sa=", "distante", "theirs=", "entrante", "fusionnee", "autre", "their="]);
+            return match (ours, theirs) {
+                (true, false) => Ok(vec![Action::ResolveConflicts { path, files: vec![], strategy: "ours".into() }]),
+                (false, true) => Ok(vec![Action::ResolveConflicts { path, files: vec![], strategy: "theirs".into() }]),
+                _ => q("Quelle version garder pour les conflits : la vôtre (branche courante) ou celle de la branche fusionnée ?"),
+            };
+        }
+        if !has(c, &["fusionn"]) {
+            return Ok(vec![Action::InspectConflicts { path }]);
+        }
+    }
+    // 0. Mettre de côté / remettre (stash) et envoyer une étiquette
+    if has(c, &["cote=", "stash"]) {
+        if has(c, &["remet", "restaur", "recuper", "reprend", "pop=", "retrouv", "rappell"]) {
+            return Ok(vec![Action::RestoreStash { path }]);
+        }
+        return Ok(vec![Action::StashChanges { path, message: x.message.clone() }]);
+    }
+    if has(c, &["tag=", "tags=", "etiquet"]) && has(c, &["envoi", "envoy", "push", "pouss", "publi", "televers"]) {
+        let i = pos(c, &["tag=", "tags=", "etiquet"]).unwrap_or(0);
+        let name = c[i + 1..].iter().find(|t| !is_stop(&t.norm) && !matches!(t.norm.as_str(), "version" | "nomme" | "nommee" | "appele" | "appelee")).map(|t| t.orig.clone());
+        return match name {
+            Some(name) => Ok(vec![Action::PushTag { path, name, remote: None }]),
+            None => q("Quelle étiquette souhaitez-vous envoyer (par exemple v1.0.0) ?"),
+        };
+    }
     // 1. Annuler / abandonner des modifications
     if has(c, &["annul", "undo", "discard", "abandon", "revert", "restaur", "jette"]) {
         if has(c, &["commit"]) {
-            return q("Annuler un commit n'est pas encore pris en charge par GIT DRENN. Souhaitez-vous plutôt abandonner les modifications non enregistrées ?");
+            return Ok(vec![Action::UndoLastCommit { path }]);
         }
         if has(c, &["modif", "change", "travail"]) {
             return Ok(vec![Action::DiscardChanges { path, files: vec![] }]);
@@ -190,6 +227,30 @@ fn clause(c: &[Tok], x: &Ctx) -> Result<Vec<Action>, String> {
             return Ok(vec![Action::PullChanges { path }]);
         }
         return q("Quel dépôt souhaitez-vous récupérer (nom, propriétaire/nom ou URL) ?");
+    }
+    // 6b. Fusion, étiquettes, .gitignore
+    if let Some(i) = pos(c, &["fusionn", "fusion", "merge"]) {
+        let name = c[i + 1..].iter().find(|t| !is_stop(&t.norm) && !t.norm.starts_with("branch")).map(|t| t.orig.clone());
+        return match name {
+            Some(name) => Ok(vec![Action::MergeBranch { path, name, keep_conflicts: x.keep_conflicts }]),
+            None => q("Quelle branche souhaitez-vous fusionner dans la branche courante ?"),
+        };
+    }
+    if let Some(i) = pos(c, &["tag=", "tags=", "etiquet"]) {
+        let name = c[i + 1..].iter().find(|t| !is_stop(&t.norm) && !matches!(t.norm.as_str(), "version" | "nomme" | "nommee" | "appele" | "appelee")).map(|t| t.orig.clone());
+        return match name {
+            Some(name) => Ok(vec![Action::CreateTag { path, name, message: x.message.clone() }]),
+            None => q("Quel nom donner à l'étiquette (par exemple v1.0.0) ?"),
+        };
+    }
+    if has(c, &["gitignore", "ignore="]) || (has(c, &["ignor"]) && has(c, &["fichier", "secret", "env"])) {
+        let pats: Vec<String> = c
+            .iter()
+            .filter(|t| t.orig.starts_with('.') || t.orig.contains('*') || t.orig.ends_with('/'))
+            .filter(|t| !t.norm.contains("gitignore"))
+            .map(|t| t.orig.clone())
+            .collect();
+        return Ok(vec![Action::UpdateGitignore { path, patterns: pats }]);
     }
     // 7. Branches
     if let Some(i) = pos(c, &["branch"]) {
@@ -257,7 +318,12 @@ pub fn plan(instruction: &str, ctx: &PlanContext) -> Res<Plan> {
         return Err("instruction vide".into());
     }
     let (message, remaining) = extract_quoted(instruction);
-    let clauses = tokenize(&remaining);
+    let mut clauses = tokenize(&remaining);
+    // Une demande de .gitignore énumère souvent plusieurs motifs séparés par « et » : une seule clause.
+    if normalize(&remaining).contains("gitignore") {
+        let flat: Vec<Tok> = clauses.into_iter().flatten().collect();
+        clauses = vec![flat];
+    }
     let all: Vec<&Tok> = clauses.iter().flatten().collect();
     let public = all.iter().any(|t| t.norm.starts_with("public")) && !all.iter().any(|t| t.norm.starts_with("prive") || t.norm == "private");
     // Projet cité n'importe où dans la demande (sauf clauses de clonage, où le nom est le dépôt distant).
@@ -265,7 +331,8 @@ pub fn plan(instruction: &str, ctx: &PlanContext) -> Res<Plan> {
         .iter()
         .filter(|c| pos(c, &["clon", "telecharg", "download"]).is_none())
         .find_map(|c| project_name(c));
-    let x = Ctx { pc: ctx, project, message, public };
+    let keep_conflicts = normalize(&remaining).contains("conflit");
+    let x = Ctx { pc: ctx, project, message, public, keep_conflicts };
 
     let mut plan = Plan { goal: truncate(instruction, 140), ..Plan::default() };
     for c in &clauses {
@@ -293,6 +360,10 @@ pub fn plan(instruction: &str, ctx: &PlanContext) -> Res<Plan> {
     // (sinon l'étape viserait le dossier courant, pas le projet cloné).
     if matches!(plan.steps.first(), Some(Action::CloneRepository { .. })) {
         plan.steps.retain(|s| !matches!(s, Action::InspectRepository { path: None }));
+    }
+    // « Fusionne X et laisse-moi gérer les conflits » : la fusion présente déjà les conflits.
+    if plan.steps.iter().any(|s| matches!(s, Action::MergeBranch { keep_conflicts: true, .. })) {
+        plan.steps.retain(|s| !matches!(s, Action::InspectConflicts { .. }));
     }
     // Dédoublonnage des étapes strictement identiques consécutives.
     plan.steps.dedup();
@@ -377,7 +448,40 @@ mod tests {
         let p = plan("blabla zzz", &ctx(true)).unwrap();
         assert!(p.steps.is_empty() && p.question.is_some());
         let p = plan("Annule mon dernier commit", &ctx(true)).unwrap();
-        assert!(p.question.is_some());
+        assert_eq!(p.steps, vec![Action::UndoLastCommit { path: None }]);
+    }
+
+    #[test]
+    fn nouvelles_fonctions() {
+        let p = plan("Fusionne la branche login", &ctx(true)).unwrap();
+        assert_eq!(p.steps, vec![Action::MergeBranch { path: None, name: "login".into(), keep_conflicts: false }]);
+        let p = plan("Fusionne la branche login et laisse-moi gérer les conflits", &ctx(true)).unwrap();
+        assert_eq!(p.steps, vec![Action::MergeBranch { path: None, name: "login".into(), keep_conflicts: true }]);
+        let p = plan("Montre-moi les conflits", &ctx(true)).unwrap();
+        assert_eq!(p.steps, vec![Action::InspectConflicts { path: None }]);
+        let p = plan("Résous les conflits en gardant ma version", &ctx(true)).unwrap();
+        assert_eq!(p.steps, vec![Action::ResolveConflicts { path: None, files: vec![], strategy: "ours".into() }]);
+        let p = plan("Résous les conflits en gardant la version distante", &ctx(true)).unwrap();
+        assert_eq!(p.steps, vec![Action::ResolveConflicts { path: None, files: vec![], strategy: "theirs".into() }]);
+        assert!(plan("résous les conflits", &ctx(true)).unwrap().question.is_some());
+        assert_eq!(plan("Annule la fusion", &ctx(true)).unwrap().steps, vec![Action::AbortMerge { path: None }]);
+        assert_eq!(plan("Termine la fusion", &ctx(true)).unwrap().steps, vec![Action::ContinueMerge { path: None }]);
+        let p = plan("crée un tag v1.0.0", &ctx(true)).unwrap();
+        assert_eq!(p.steps, vec![Action::CreateTag { path: None, name: "v1.0.0".into(), message: None }]);
+        let p = plan("ajoute .env et *.log au gitignore", &ctx(true)).unwrap();
+        assert_eq!(p.steps, vec![Action::UpdateGitignore { path: None, patterns: vec![".env".into(), "*.log".into()] }]);
+        let p = plan("complète le gitignore du projet Blog", &ctx(true)).unwrap();
+        assert_eq!(p.steps, vec![Action::UpdateGitignore { path: Some("Blog".into()), patterns: vec![] }]);
+    }
+
+    #[test]
+    fn stash_et_tag_distant() {
+        let p = plan("Mets de côté mes modifications", &ctx(true)).unwrap();
+        assert_eq!(p.steps, vec![Action::StashChanges { path: None, message: None }]);
+        let p = plan("Remets mes modifications mises de côté", &ctx(true)).unwrap();
+        assert_eq!(p.steps, vec![Action::RestoreStash { path: None }]);
+        let p = plan("envoie le tag v1.0.0 sur GitHub", &ctx(true)).unwrap();
+        assert_eq!(p.steps, vec![Action::PushTag { path: None, name: "v1.0.0".into(), remote: None }]);
     }
 
     #[test]

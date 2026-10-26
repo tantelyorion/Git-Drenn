@@ -1,0 +1,37 @@
+# Compile et teste GIT DRENN sur Windows (aucune installation nécessaire sur votre PC).
+# Déclenchement : à chaque envoi de code (tests seulement) ou manuellement (Actions > Windows > Run workflow),
+# ce qui produit en plus drenn.exe téléchargeable. Aucune version/release n'est créée automatiquement.
+name: Windows
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Versions des outils
+        run: |
+          git --version
+          rustc --version
+          cargo --version
+      - name: Tests
+        run: cargo test --release
+      - name: Compilation (avec l'icône de la mascotte)
+        if: github.event_name == 'workflow_dispatch'
+        run: cargo build --release --features icon
+      - name: Empreinte SHA-256
+        if: github.event_name == 'workflow_dispatch'
+        shell: pwsh
+        run: Get-FileHash target\release\drenn.exe -Algorithm SHA256 | Format-List
+      - name: Publier drenn.exe (artefact)
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: git-drenn-windows
+          path: |
+            target/release/drenn.exe
+            README.md
+            docs/GUIDE_COMPILATION.md

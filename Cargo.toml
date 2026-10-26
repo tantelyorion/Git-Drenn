@@ -1,6 +1,6 @@
 [package]
 name = "git-drenn"
-version = "0.1.0"
+version = "0.5.0"
 edition = "2021"
 description = "GIT DRENN - Git Powered by AI : un agent léger qui transforme des instructions en opérations Git vérifiées"
 license = "MIT"
@@ -8,6 +8,14 @@ license = "MIT"
 [[bin]]
 name = "drenn"
 path = "src/main.rs"
+
+
+[features]
+# Intègre l'icône de la mascotte à drenn.exe (Windows) : cargo build --release --features icon
+icon = ["winres"]
+
+[build-dependencies]
+winres = { version = "0.1", optional = true }
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }

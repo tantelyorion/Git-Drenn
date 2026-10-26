@@ -38,7 +38,7 @@ impl PlanContext {
 
 const SYSTEM: &str = "Tu es l'agent de GIT DRENN. Tu transformes la demande de l'utilisateur en plan JSON. Réponds UNIQUEMENT par un objet JSON.\n\
 Format : {\"goal\":\"...\",\"question\":null,\"steps\":[{\"action\":\"...\",...}]}\n\
-Actions (paramètres) : inspect_repository(path) clone_repository(url,destination) initialize_repository(path) inspect_status(path) inspect_diff(path,staged) inspect_history(path,limit) list_branches(path) create_branch(path,name) switch_branch(path,name) stage_changes(path,files) create_commit(path,message) fetch_changes(path) pull_changes(path) push_changes(path,remote,branch) inspect_remotes(path) configure_remote(path,name,url) discard_changes(path,files) search_remote_repository(query) create_remote_repository(name,private,description,path) inspect_remote_repository(repository) verify_remote_push(path)\n\
+Actions (paramètres) : inspect_repository(path) clone_repository(url,destination) initialize_repository(path) inspect_status(path) inspect_diff(path,staged) inspect_history(path,limit) list_branches(path) create_branch(path,name) switch_branch(path,name) stage_changes(path,files) create_commit(path,message) fetch_changes(path) pull_changes(path) push_changes(path,remote,branch) inspect_remotes(path) configure_remote(path,name,url) discard_changes(path,files) update_gitignore(path,patterns) undo_last_commit(path) merge_branch(path,name,keep_conflicts) inspect_conflicts(path) resolve_conflicts(path,files,strategy=ours|theirs) abort_merge(path) continue_merge(path) create_tag(path,name,message) push_tag(path,name,remote) stash_changes(path,message) restore_stash(path) search_remote_repository(query) create_remote_repository(name,private,description,path) inspect_remote_repository(repository) verify_remote_push(path)\n\
 Règles : path = nom ou chemin du projet (omis = dossier courant). N'invente jamais de commande. Si la demande est ambiguë, renseigne question et laisse steps vide. Un dépôt GitHub est privé sauf demande explicite.\n\
 Exemples :\n\
 Demande : Enregistre mes modifications\n\
@@ -72,7 +72,10 @@ pub fn plan_schema() -> Value {
                         "repository": {"type": "string"},
                         "description": {"type": "string"},
                         "files": {"type": "array", "items": {"type": "string"}},
+                        "patterns": {"type": "array", "items": {"type": "string"}},
                         "staged": {"type": "boolean"},
+                        "keep_conflicts": {"type": "boolean"},
+                        "strategy": {"enum": ["ours", "theirs"]},
                         "private": {"type": "boolean"},
                         "limit": {"type": "integer"}
                     },

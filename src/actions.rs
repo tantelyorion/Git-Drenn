@@ -34,6 +34,17 @@ pub enum Action {
     InspectRemotes { #[serde(default)] path: Option<String> },
     ConfigureRemote { #[serde(default)] path: Option<String>, #[serde(default)] name: Option<String>, url: String },
     DiscardChanges { #[serde(default)] path: Option<String>, #[serde(default)] files: Vec<String> },
+    UpdateGitignore { #[serde(default)] path: Option<String>, #[serde(default)] patterns: Vec<String> },
+    UndoLastCommit { #[serde(default)] path: Option<String> },
+    MergeBranch { #[serde(default)] path: Option<String>, name: String, #[serde(default)] keep_conflicts: bool },
+    InspectConflicts { #[serde(default)] path: Option<String> },
+    ResolveConflicts { #[serde(default)] path: Option<String>, #[serde(default)] files: Vec<String>, strategy: String },
+    AbortMerge { #[serde(default)] path: Option<String> },
+    ContinueMerge { #[serde(default)] path: Option<String> },
+    CreateTag { #[serde(default)] path: Option<String>, name: String, #[serde(default)] message: Option<String> },
+    PushTag { #[serde(default)] path: Option<String>, name: String, #[serde(default)] remote: Option<String> },
+    StashChanges { #[serde(default)] path: Option<String>, #[serde(default)] message: Option<String> },
+    RestoreStash { #[serde(default)] path: Option<String> },
     ListRemoteRepositories {},
     SearchRemoteRepository { query: String },
     CreateRemoteRepository {
@@ -54,6 +65,8 @@ pub const ACTION_NAMES: &[&str] = &[
     "inspect_repository", "clone_repository", "initialize_repository", "inspect_status", "inspect_diff",
     "inspect_history", "list_branches", "create_branch", "switch_branch", "stage_changes", "create_commit",
     "fetch_changes", "pull_changes", "push_changes", "inspect_remotes", "configure_remote", "discard_changes",
+    "update_gitignore", "undo_last_commit", "merge_branch", "create_tag", "push_tag", "stash_changes", "restore_stash",
+    "inspect_conflicts", "resolve_conflicts", "abort_merge", "continue_merge",
     "list_remote_repositories", "search_remote_repository", "create_remote_repository",
     "inspect_remote_repository", "verify_remote_push",
 ];
@@ -61,7 +74,7 @@ pub const ACTION_NAMES: &[&str] = &[
 fn p(path: &Option<String>) -> String {
     match path.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
         Some(s) => format!("« {s} »"),
-        None => "le dossier courant".into(),
+        None => "ce dossier".into(),
     }
 }
 
@@ -71,9 +84,12 @@ impl Action {
         match self {
             InspectRepository { .. } | InspectStatus { .. } | InspectDiff { .. } | InspectHistory { .. }
             | ListBranches { .. } | InspectRemotes { .. } | ListRemoteRepositories {} | SearchRemoteRepository { .. }
-            | InspectRemoteRepository { .. } | VerifyRemotePush { .. } | FetchChanges { .. } => Risk::Low,
+            | InspectRemoteRepository { .. } | VerifyRemotePush { .. } | FetchChanges { .. } | InspectConflicts { .. } => Risk::Low,
             CloneRepository { .. } | InitializeRepository { .. } | CreateBranch { .. } | SwitchBranch { .. }
-            | StageChanges { .. } | CreateCommit { .. } | PullChanges { .. } | ConfigureRemote { .. } => Risk::Medium,
+            | StageChanges { .. } | CreateCommit { .. } | PullChanges { .. } | ConfigureRemote { .. }
+            | UpdateGitignore { .. } | UndoLastCommit { .. } | MergeBranch { .. } | CreateTag { .. }
+            | StashChanges { .. } | RestoreStash { .. } | AbortMerge { .. } | ContinueMerge { .. } => Risk::Medium,
+            PushTag { .. } | ResolveConflicts { .. } => Risk::High,
             PushChanges { force, .. } => if *force { Risk::Critical } else { Risk::High },
             CreateRemoteRepository { private, .. } => if *private { Risk::High } else { Risk::Critical },
             DiscardChanges { .. } => Risk::Critical,
@@ -82,7 +98,7 @@ impl Action {
 
     pub fn needs_network(&self) -> bool {
         use Action::*;
-        matches!(self, CloneRepository { .. } | FetchChanges { .. } | PullChanges { .. } | PushChanges { .. }
+        matches!(self, CloneRepository { .. } | FetchChanges { .. } | PullChanges { .. } | PushChanges { .. } | PushTag { .. }
             | ListRemoteRepositories {} | SearchRemoteRepository { .. } | CreateRemoteRepository { .. }
             | InspectRemoteRepository { .. } | VerifyRemotePush { .. })
     }
@@ -128,6 +144,30 @@ impl Action {
                 if files.is_empty() { "suivies".to_string() } else { format!("de {} fichier(s)", files.len()) },
                 p(path)
             ),
+            UpdateGitignore { patterns, path } => if patterns.is_empty() {
+                format!("Compléter le .gitignore de {} (secrets et dossiers générés)", p(path))
+            } else {
+                format!("Ajouter {} règle(s) au .gitignore de {}", patterns.len(), p(path))
+            },
+            UndoLastCommit { path } => format!("Annuler le dernier commit de {} en gardant toutes ses modifications", p(path)),
+            MergeBranch { name, path, keep_conflicts } => format!(
+                "Fusionner la branche « {name} » dans la branche courante de {}{}",
+                p(path),
+                if *keep_conflicts { " (conflits conservés pour résolution guidée)" } else { "" }
+            ),
+            InspectConflicts { path } => format!("Lister les fichiers en conflit de {}", p(path)),
+            ResolveConflicts { files, strategy, path } => format!(
+                "Résoudre les conflits de {} ({}) en gardant la version {}",
+                p(path),
+                if files.is_empty() { "tous les fichiers".to_string() } else { format!("{} fichier(s)", files.len()) },
+                if strategy == "ours" { "de la branche COURANTE" } else { "de la branche FUSIONNÉE" }
+            ),
+            AbortMerge { path } => format!("Annuler la fusion en cours dans {} (retour à l'état d'avant)", p(path)),
+            ContinueMerge { path } => format!("Terminer la fusion en cours dans {} (création du commit de fusion)", p(path)),
+            CreateTag { name, path, .. } => format!("Créer l'étiquette de version « {name} » sur le dernier commit de {}", p(path)),
+            PushTag { name, remote, path } => format!("Envoyer l'étiquette « {name} » de {} vers {}", p(path), remote.as_deref().unwrap_or("origin")),
+            StashChanges { path, .. } => format!("Mettre de côté les modifications en cours de {} (récupérables)", p(path)),
+            RestoreStash { path } => format!("Remettre les dernières modifications mises de côté dans {}", p(path)),
             ListRemoteRepositories {} => "Lister vos dépôts GitHub".into(),
             SearchRemoteRepository { query } => format!("Rechercher « {query} » sur GitHub"),
             CreateRemoteRepository { name, private, .. } => format!(
