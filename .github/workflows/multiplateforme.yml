@@ -1,0 +1,34 @@
+name: multiplateforme
+# Tests sur Windows, macOS et Linux à chaque envoi ; binaires téléchargeables à la demande ; BSD en essai (expérimental).
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test --release
+      - run: cargo build --release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: drenn-${{ matrix.os }}
+          path: |
+            target/release/drenn
+            target/release/drenn.exe
+          if-no-files-found: ignore
+  freebsd:
+    runs-on: ubuntu-latest
+    continue-on-error: true   # expérimental : vmactions/freebsd-vm
+    steps:
+      - uses: actions/checkout@v4
+      - uses: vmactions/freebsd-vm@v1
+        with:
+          prepare: pkg install -y rust git curl
+          run: cargo test --release

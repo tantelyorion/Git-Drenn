@@ -157,10 +157,15 @@ impl Action {
             ),
             InspectConflicts { path } => format!("Lister les fichiers en conflit de {}", p(path)),
             ResolveConflicts { files, strategy, path } => format!(
-                "Résoudre les conflits de {} ({}) en gardant la version {}",
+                "Résoudre les conflits de {} ({}) {}",
                 p(path),
                 if files.is_empty() { "tous les fichiers".to_string() } else { format!("{} fichier(s)", files.len()) },
-                if strategy == "ours" { "de la branche COURANTE" } else { "de la branche FUSIONNÉE" }
+                match strategy.as_str() {
+                    "ours" => "en gardant la version de la branche COURANTE",
+                    "both" => "en gardant les DEUX versions de chaque zone",
+                    "ask" => "zone par zone, avec votre choix à chaque fois",
+                    _ => "en gardant la version de la branche FUSIONNÉE",
+                }
             ),
             AbortMerge { path } => format!("Annuler la fusion en cours dans {} (retour à l'état d'avant)", p(path)),
             ContinueMerge { path } => format!("Terminer la fusion en cours dans {} (création du commit de fusion)", p(path)),

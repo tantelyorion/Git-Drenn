@@ -26,7 +26,7 @@ Résumé :
 3. `curl.exe` (inclus dans Windows 10/11) sert aux appels à l'API GitHub.
 
 ## Modèle IA (facultatif)
-**Guide détaillé (choix du modèle, installation guidée, dépannage) : [docs/GUIDE_MODELE_IA.md](docs/GUIDE_MODELE_IA.md)** — modèle conseillé : Qwen2.5-1.5B-Instruct Q4_K_M (4 Go de RAM) ou 3B (8 Go) ; `scripts\setup-model.ps1` l'installe pas à pas.
+**Guide détaillé : [docs/GUIDE_MODELE_IA.md](docs/GUIDE_MODELE_IA.md)** — en deux commandes, sur tous les systèmes : `drenn model engine` puis `drenn model install` (modèle choisi selon votre RAM, ex. Qwen2.5-1.5B-Instruct Q4_K_M pour 4 Go).
 
 Sans modèle, un analyseur de règles FR/EN comprend les demandes courantes. Pour le modèle local :
 1. Télécharger `llama-cli.exe` (https://github.com/ggml-org/llama.cpp/releases) et un modèle GGUF quantifié (ex. Qwen petit, Q4).
@@ -44,6 +44,14 @@ Sans modèle, un analyseur de règles FR/EN comprend les demandes courantes. Pou
 - `discard_changes` crée une sauvegarde (`refs/drenn/backup/…`, récupérable par `git stash apply`) et ne touche jamais aux fichiers non suivis.
 - Le contenu des dépôts n'est jamais envoyé au modèle ; hooks Git désactivés ; aucun script de projet exécuté.
 - Jeton GitHub : variable `GITHUB_TOKEN` ou `drenn auth login` (fichier local) ; transmis par environnement/stdin, jamais en argument, masqué des sorties.
+
+## Nouveautés de la v0.6.0
+- **Moteur IA persistant** (`llama-server`, modèle gardé en mémoire, déchargé après inactivité) ou serveur local compatible OpenAI (Ollama, LM Studio).
+- **`drenn model`** : choix du modèle selon votre RAM, téléchargement vérifié (SHA-256), détection de llama.cpp, sur Windows, macOS, Linux et BSD.
+- **Mode cloud facultatif** (désactivé par défaut, consentement à chaque session, jamais le contenu des dépôts).
+- **Messages de commit par IA locale** (à partir des noms de fichiers uniquement), **mode apprentissage** (`--teach`) et glossaire (« c'est quoi un commit ? »).
+- **Conflits de fusion zone par zone** : « résous les conflits un par un ».
+- Multiplateforme : `scripts/install.sh`, CI Windows/macOS/Linux/FreeBSD, [docs/INSTALL_PLATEFORMES.md](docs/INSTALL_PLATEFORMES.md).
 
 ## Nouveautés de la v0.5.0 — interface graphique
 Boutons **Aide** et **À propos** (créateur : Mr Tantely Orion) dans l'interface ; `drenn about`, `drenn --help` et `drenn --version` indiquent aussi le créateur.

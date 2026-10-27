@@ -154,10 +154,18 @@ fn clause(c: &[Tok], x: &Ctx) -> Result<Vec<Action>, String> {
         if has(c, &["reso", "resol", "regle", "corrige", "resolve", "fix"]) {
             let ours = has(c, &["ma=", "mienne", "miennes", "courante", "locale", "ours=", "moi=", "mon=", "my=", "mine="]);
             let theirs = has(c, &["leur", "sa=", "distante", "theirs=", "entrante", "fusionnee", "autre", "their="]);
+            // Zone par zone : « résous les conflits un par un / zone par zone / ligne par ligne / pas à pas ».
+            let ask = has(c, &["zone", "morceau", "ligne", "guide", "interactif", "detail", "chacun", "pas="]) || (has(c, &["par="]) && has(c, &["un=", "une="]));
+            if ask {
+                return Ok(vec![Action::ResolveConflicts { path, files: vec![], strategy: "ask".into() }]);
+            }
+            if has(c, &["deux", "both", "ensemble"]) {
+                return Ok(vec![Action::ResolveConflicts { path, files: vec![], strategy: "both".into() }]);
+            }
             return match (ours, theirs) {
                 (true, false) => Ok(vec![Action::ResolveConflicts { path, files: vec![], strategy: "ours".into() }]),
                 (false, true) => Ok(vec![Action::ResolveConflicts { path, files: vec![], strategy: "theirs".into() }]),
-                _ => q("Quelle version garder pour les conflits : la vôtre (branche courante) ou celle de la branche fusionnée ?"),
+                _ => q("Comment résoudre les conflits : garder la vôtre (branche courante), celle de la branche fusionnée, les deux, ou « un par un » (zone par zone, avec vous) ?"),
             };
         }
         if !has(c, &["fusionn"]) {
@@ -464,6 +472,12 @@ mod tests {
         let p = plan("Résous les conflits en gardant la version distante", &ctx(true)).unwrap();
         assert_eq!(p.steps, vec![Action::ResolveConflicts { path: None, files: vec![], strategy: "theirs".into() }]);
         assert!(plan("résous les conflits", &ctx(true)).unwrap().question.is_some());
+        for phrase in ["Résous les conflits un par un", "résous les conflits zone par zone", "résous les conflits ligne par ligne"] {
+            let p = plan(phrase, &ctx(true)).unwrap();
+            assert_eq!(p.steps, vec![Action::ResolveConflicts { path: None, files: vec![], strategy: "ask".into() }], "{phrase}");
+        }
+        let p = plan("résous les conflits en gardant les deux", &ctx(true)).unwrap();
+        assert_eq!(p.steps, vec![Action::ResolveConflicts { path: None, files: vec![], strategy: "both".into() }]);
         assert_eq!(plan("Annule la fusion", &ctx(true)).unwrap().steps, vec![Action::AbortMerge { path: None }]);
         assert_eq!(plan("Termine la fusion", &ctx(true)).unwrap().steps, vec![Action::ContinueMerge { path: None }]);
         let p = plan("crée un tag v1.0.0", &ctx(true)).unwrap();

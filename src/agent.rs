@@ -4,13 +4,18 @@ use crate::actions::{Action, Plan};
 use crate::config::Config;
 use crate::github::GitHub;
 use crate::gitengine::{explain_error, Entry, Git, Kind};
-use crate::planner::{LlamaPlanner, PlanContext};
+use crate::conflicts::{self, Choice};
+use crate::llm::{self, Llm};
+use crate::planner::{self, PlanContext};
 use crate::rules;
+use crate::teach;
 use crate::security::{self, Policy, Risk};
 use crate::ui;
 use crate::util::*;
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 pub struct Agent {
     pub cfg: Config,
@@ -22,6 +27,28 @@ pub struct Agent {
     pub force_rules: bool,
     /// Réservé aux tests : répond « oui » aux confirmations (jamais activé par la CLI).
     pub test_yes: bool,
+    /// Moteur IA choisi d'après la configuration (None = analyseur de règles seul).
+    pub llm: Option<Arc<dyn Llm>>,
+    /// Mode apprentissage de la session (en plus de `cfg.teach_mode`).
+    pub teach: AtomicBool,
+    /// Consentement donné pour cette session à l'envoi des phrases vers un service cloud.
+    cloud_ok: AtomicBool,
+    /// Réservé aux tests : choix prédéfinis pour les questions à choix multiples.
+    pub test_choices: Mutex<VecDeque<usize>>,
+}
+
+/// Nettoie la réponse d'un modèle pour en faire un objet de commit : une ligne, 72 caractères au plus.
+pub fn clean_commit_message(raw: &str) -> Option<String> {
+    let strip = |t: &str| t.trim().trim_matches(|c| matches!(c, '"' | '`' | '\'' | '«' | '»' | '.')).trim().to_string();
+    let first = raw.lines().map(str::trim).find(|l| !l.is_empty())?;
+    let mut line = strip(first);
+    for p in ["message :", "message:", "commit :", "commit:"] {
+        if line.to_lowercase().starts_with(p) {
+            line = strip(&line[p.len()..]);
+        }
+    }
+    let line: String = line.chars().filter(|c| !c.is_control()).take(72).collect::<String>().trim().to_string();
+    if line.chars().count() < 4 { None } else { Some(line) }
 }
 
 fn clean(s: &str) -> String {
@@ -57,7 +84,45 @@ impl Agent {
         let git = Git::detect(&cfg, token.clone())?;
         let cwd = canonicalize_lenient(&cwd)?;
         let policy = Policy::new(&cfg, &cwd);
-        Ok(Agent { cfg, policy, git, gh: GitHub::new(token), cwd, dry_run: false, force_rules: false, test_yes: false })
+        let llm = llm::select(&cfg);
+        let teach = AtomicBool::new(cfg.teach_mode);
+        Ok(Agent {
+            cfg,
+            policy,
+            git,
+            gh: GitHub::new(token),
+            cwd,
+            dry_run: false,
+            force_rules: false,
+            test_yes: false,
+            llm,
+            teach,
+            cloud_ok: AtomicBool::new(false),
+            test_choices: Mutex::new(VecDeque::new()),
+        })
+    }
+
+    /// Choix multiple (les tests injectent leurs réponses ; sinon console ou interface graphique).
+    fn pick(&self, q: &str, opts: &[String]) -> Option<usize> {
+        if self.test_yes {
+            return self.test_choices.lock().ok().and_then(|mut c| c.pop_front());
+        }
+        ui::choose(q, opts)
+    }
+
+    /// Un moteur distant n'est utilisé qu'avec l'accord explicite de l'utilisateur, une fois par session.
+    fn allow_llm(&self, l: &dyn Llm) -> bool {
+        if l.is_local() || self.cloud_ok.load(Ordering::SeqCst) {
+            return true;
+        }
+        ui::warn(format!("Le moteur configuré est : {}. Votre phrase (jamais le contenu de vos fichiers) serait envoyée sur Internet.", l.name()));
+        if self.ask("Autoriser l'envoi pour cette session ?") {
+            self.cloud_ok.store(true, Ordering::SeqCst);
+            true
+        } else {
+            ui::info("Refusé : l'analyseur de règles local est utilisé.");
+            false
+        }
     }
 
     fn ask(&self, q: &str) -> bool {
@@ -197,19 +262,21 @@ impl Agent {
 
     // ------------------------------------------------------------ plan
 
-    fn make_plan(&self, instruction: &str) -> Res<(Plan, &'static str)> {
+    fn make_plan(&self, instruction: &str) -> Res<(Plan, String)> {
         let ctx = self.context();
         if !self.force_rules {
-            if let Some(lp) = LlamaPlanner::from_cfg(&self.cfg) {
-                ui::info("Analyse de la demande par le modèle local…");
-                match lp.plan(instruction, &ctx) {
-                    Ok(p) if !p.is_empty() => return Ok((p, "modèle local")),
-                    Ok(_) => ui::warn("réponse vide du modèle — repli sur l'analyseur de règles"),
-                    Err(e) => ui::warn(format!("modèle IA indisponible ou invalide ({e}) — repli sur l'analyseur de règles")),
+            if let Some(l) = &self.llm {
+                if self.allow_llm(l.as_ref()) {
+                    ui::info(format!("Analyse de la demande par : {}…", l.name()));
+                    match planner::plan_with(l.as_ref(), instruction, &ctx, self.cfg.max_tokens) {
+                        Ok(p) if !p.is_empty() => return Ok((p, l.name())),
+                        Ok(_) => ui::warn("réponse vide du modèle — repli sur l'analyseur de règles"),
+                        Err(e) => ui::warn(format!("modèle IA indisponible ou invalide ({e}) — repli sur l'analyseur de règles")),
+                    }
                 }
             }
         }
-        rules::plan(instruction, &ctx).map(|p| (p, "analyseur de règles"))
+        rules::plan(instruction, &ctx).map(|p| (p, "analyseur de règles".to_string()))
     }
 
     /// Validation statique des paramètres, AVANT toute confirmation ou exécution.
@@ -253,8 +320,8 @@ impl Agent {
             }
             StashChanges { message: Some(m), .. } => security::valid_commit_message(m),
             ResolveConflicts { files, strategy, .. } => {
-                if strategy != "ours" && strategy != "theirs" {
-                    return Err("stratégie invalide : « ours » (branche courante) ou « theirs » (branche fusionnée)".into());
+                if !["ours", "theirs", "both", "ask"].contains(&strategy.as_str()) {
+                    return Err("stratégie invalide : « ours » (branche courante), « theirs » (branche fusionnée), « both » (les deux) ou « ask » (zone par zone)".into());
                 }
                 rels(files)
             }
@@ -295,6 +362,10 @@ impl Agent {
 
     /// Point d'entrée : traite une instruction de bout en bout. Renvoie vrai si tout s'est bien passé.
     pub fn handle(&self, instruction: &str) -> bool {
+        if let Some(ok) = self.teach_command(instruction) {
+            return ok;
+        }
+        let teaching = self.teach.load(Ordering::SeqCst);
         let (plan, source) = match self.make_plan(instruction) {
             Ok(x) => x,
             Err(e) => {
@@ -319,6 +390,11 @@ impl Agent {
             };
             let net = if s.needs_network() { " (Internet)" } else { "" };
             ui::say(format!("  {}. [{tag}] {}{net}", i + 1, s.describe()));
+            if teaching {
+                if let Some((cmd, why)) = teach::equivalent(s) {
+                    ui::say(format!("       Git : {cmd}\n       {why}"));
+                }
+            }
         }
         for (i, s) in plan.steps.iter().enumerate() {
             if let Err(e) = self.validate(s) {
@@ -370,6 +446,49 @@ impl Agent {
         }
         self.log_history(instruction, &plan.goal, &results);
         all_ok
+    }
+
+    /// « mode apprentissage », « c'est quoi un commit ? », « explique le stash » : réponses pédagogiques sans toucher au dépôt.
+    fn teach_command(&self, instruction: &str) -> Option<bool> {
+        let n = teach::norm(instruction);
+        if n.contains("mode apprentissage") || n.contains("mode pedagogique") || n.contains("mode explication") || n.contains("mode teach") {
+            let off = ["desactiv", "arret", "stop", "coupe", "retire", "sans ", " off"].iter().any(|k| n.contains(k));
+            self.teach.store(!off, Ordering::SeqCst);
+            if off {
+                ui::ok("Mode apprentissage désactivé.");
+            } else {
+                ui::ok("Mode apprentissage activé : chaque étape sera accompagnée de la commande Git équivalente et d'une explication.");
+            }
+            return Some(true);
+        }
+        let (term, pure) = teach::definition_request(instruction)?;
+        if let Some(t) = teach::glossary(&term) {
+            ui::say(format!("\n{t}"));
+            return Some(true);
+        }
+        if !pure {
+            return None; // « explique l'état du projet » : demande d'action ordinaire
+        }
+        let Some(l) = &self.llm else {
+            ui::say(format!("Je n'ai pas de définition pour « {term} » dans mon glossaire (commit, branche, fusion, conflit, stash, remote, push, pull, fetch, clone, tag, index, gitignore, HEAD, dépôt…).\nInstallez un modèle IA (`drenn model install`) pour des réponses libres."));
+            return Some(false);
+        };
+        if self.force_rules || !self.allow_llm(l.as_ref()) {
+            ui::say(format!("Je n'ai pas de définition pour « {term} » dans mon glossaire."));
+            return Some(false);
+        }
+        const TEACHER: &str = "Tu es un professeur de Git patient. Réponds en français, en 6 phrases maximum, avec des mots simples et un exemple concret. Si une commande peut détruire du travail, préviens-en clairement.";
+        match l.chat(TEACHER, &format!("Question : {term}"), None, 350) {
+            Ok(t) if !t.trim().is_empty() => {
+                ui::say(format!("\n{}", clean(t.trim())));
+                Some(true)
+            }
+            Ok(_) => Some(false),
+            Err(e) => {
+                ui::err(format!("explication impossible : {e}"));
+                Some(false)
+            }
+        }
     }
 
     fn log_history(&self, instruction: &str, goal: &str, results: &[(String, bool, String)]) {
@@ -806,7 +925,8 @@ impl Agent {
             let names: Vec<&str> = staged.iter().map(|s| s.rsplit('/').next().unwrap_or(s)).collect();
             let head = names.iter().take(3).cloned().collect::<Vec<_>>().join(", ");
             let extra = if names.len() > 3 { format!(" (+{} autres)", names.len() - 3) } else { String::new() };
-            format!("{} : {head}{extra}", if before.is_none() { "Premier commit" } else { "Mise à jour" })
+            let fallback = format!("{} : {head}{extra}", if before.is_none() { "Premier commit" } else { "Mise à jour" });
+            self.ai_commit_message(&repo, staged.len()).unwrap_or(fallback)
         } else {
             message.trim().to_string()
         };
@@ -821,6 +941,48 @@ impl Agent {
             return Err("le commit créé ne correspond pas au message attendu".into());
         }
         Ok(format!("Commit {} créé : « {subj} » ({} fichier(s)).", short(&after), staged.len()))
+    }
+
+    /// Message de commit rédigé par un modèle LOCAL à partir de la nature du changement et du NOM des fichiers
+    /// (jamais de leur contenu, jamais vers un service cloud). Toute anomalie : message standard.
+    fn ai_commit_message(&self, repo: &Path, total: usize) -> Option<String> {
+        if !self.cfg.ai_commit_messages || self.force_rules {
+            return None;
+        }
+        let l = self.llm.as_ref().filter(|l| l.is_local())?;
+        let ns = self.git.out(repo, &["diff", "--cached", "--name-status", "--no-color"], Kind::Local).ok()?;
+        let safe = |n: &str| -> String {
+            let t: String = n.chars().map(|c| if c.is_alphanumeric() || "._-/ ".contains(c) { c } else { '_' }).collect();
+            truncate(t.trim(), 60)
+        };
+        let mut lines = Vec::new();
+        for l in ns.lines().take(40) {
+            let mut it = l.split('\t');
+            let st = match it.next().and_then(|s| s.chars().next()) {
+                Some('A') => "ajouté",
+                Some('M') => "modifié",
+                Some('D') => "supprimé",
+                Some('R') => "renommé",
+                _ => "changé",
+            };
+            if let Some(name) = it.last() {
+                lines.push(format!("- {st} : {}", safe(name)));
+            }
+        }
+        if lines.is_empty() {
+            return None;
+        }
+        let sys = if self.cfg.commit_lang == "en" {
+            "You write Git commit messages. Reply ONLY with the message: a single line, 72 characters max, in English, style \"type: description\" (feat, fix, docs, refactor, chore, test), no quotes, no final period. You only receive the list of changed files (kind of change and name), never their content."
+        } else {
+            "Tu écris des messages de commit Git. Réponds UNIQUEMENT par le message : une seule ligne, 72 caractères maximum, en français, au style « type: description » (feat, fix, docs, refactor, chore, test), sans guillemets ni point final. Tu reçois seulement la liste des fichiers modifiés (nature du changement et nom), jamais leur contenu."
+        };
+        let user = format!("Fichiers ({total} au total) :\n{}", lines.join("\n"));
+        let raw = l.chat(sys, &user, None, 60).ok()?;
+        let m = clean_commit_message(&raw)?;
+        security::valid_commit_message(&m).ok()?;
+        ui::info(format!("Message proposé par l'IA : « {m} »"));
+        Some(m)
     }
 
     // ---- distant
@@ -1224,7 +1386,7 @@ impl Agent {
             let hunks = std::fs::read_to_string(repo.join(&e.path)).map(|t| t.lines().filter(|l| l.starts_with("<<<<<<<")).count()).unwrap_or(0);
             s += &format!("  - {} : {what}{}\n", e.path, if hunks > 0 { format!(" ({hunks} zone(s) à arbitrer)") } else { String::new() });
         }
-        s += "  Choisissez : « résous les conflits en gardant ma version » (branche courante) ou « … la version distante » (branche fusionnée), ou « annule la fusion ».";
+        s += "  Choisissez : « résous les conflits un par un » (zone par zone, avec vous), « … en gardant ma version » (branche courante), « … la version distante » (branche fusionnée), « … en gardant les deux », ou « annule la fusion ».";
         Ok(s)
     }
 
@@ -1239,6 +1401,9 @@ impl Agent {
             .collect();
         if targets.is_empty() {
             return Err("aucun fichier en conflit correspondant".into());
+        }
+        if strategy == "ask" || strategy == "both" {
+            return self.resolve_hunks(&repo, &targets, strategy);
         }
         let side = if strategy == "ours" { "ours" } else { "theirs" };
         let label = if side == "ours" { "de la branche COURANTE" } else { "de la branche FUSIONNÉE" };
@@ -1282,6 +1447,116 @@ impl Agent {
             bdir.display(),
             if left > 0 { format!("Il reste {left} fichier(s) en conflit.") } else { "Plus aucun conflit : dites « termine la fusion ».".to_string() }
         ))
+    }
+
+    /// Résolution zone par zone (« ask », avec l'utilisateur) ou en gardant les deux versions (« both »).
+    /// Le contenu des zones n'est montré qu'à l'utilisateur : il n'est jamais envoyé à un modèle.
+    fn resolve_hunks(&self, repo: &Path, targets: &[Entry], strategy: &str) -> Res<String> {
+        if strategy == "both" && !self.ask(&format!("Garder les DEUX versions (la vôtre puis l'autre) dans chaque zone en conflit de {} fichier(s) ?", targets.len())) {
+            return Err("résolution annulée par l'utilisateur".into());
+        }
+        let bdir = repo.join(".git").join("drenn-backup").join(now_secs().to_string());
+        let mut done: Vec<(String, usize)> = Vec::new();
+        let mut skipped: Vec<String> = Vec::new();
+        let mut cancelled = false;
+        let label = |l: &str| if l.is_empty() { String::new() } else { format!(" : {}", clean(&truncate(l, 40))) };
+        'files: for e in targets {
+            if !matches!((e.x, e.y), ('U', 'U') | ('A', 'A')) {
+                skipped.push(format!("{} (supprimé d'un côté : utilisez « garder ma version » ou « la version distante »)", e.path));
+                continue;
+            }
+            let abs = repo.join(&e.path);
+            match std::fs::symlink_metadata(&abs) {
+                Ok(m) if m.is_file() && m.len() <= 5_000_000 => {}
+                _ => {
+                    skipped.push(format!("{} (fichier non ordinaire, introuvable ou trop gros)", e.path));
+                    continue;
+                }
+            }
+            let data = std::fs::read(&abs).map_err(|er| format!("lecture de {} impossible : {er}", e.path))?;
+            if data.contains(&0) {
+                skipped.push(format!("{} (fichier binaire : choisissez une version entière)", e.path));
+                continue;
+            }
+            let segs = match conflicts::parse(&data) {
+                Ok(s) => s,
+                Err(er) => {
+                    skipped.push(format!("{} ({er})", e.path));
+                    continue;
+                }
+            };
+            let n = conflicts::count(&segs);
+            let choices: Vec<Choice> = if n == 0 {
+                if !self.ask(&format!("« {} » ne contient plus de marques de conflit. Le considérer comme résolu ?", clean(&e.path))) {
+                    skipped.push(format!("{} (non validé)", e.path));
+                    continue;
+                }
+                vec![]
+            } else if strategy == "both" {
+                vec![Choice::Both; n]
+            } else {
+                let mut ch = Vec::new();
+                for (i, h) in conflicts::hunks(&segs).iter().enumerate() {
+                    let q = format!(
+                        "{} — zone {}/{}\n-- MA VERSION (branche courante{}) --\n{}\n-- VERSION FUSIONNÉE{} --\n{}\nQue garder pour cette zone ?",
+                        clean(&e.path),
+                        i + 1,
+                        n,
+                        label(&h.ours_label),
+                        clean(&conflicts::preview(&h.ours, 15)),
+                        label(&h.theirs_label),
+                        clean(&conflicts::preview(&h.theirs, 15)),
+                    );
+                    let opts = vec![
+                        "Garder MA version (branche courante)".to_string(),
+                        "Garder la version FUSIONNÉE".to_string(),
+                        "Garder les DEUX (la mienne puis l'autre)".to_string(),
+                        "Passer ce fichier (le laisser en conflit)".to_string(),
+                    ];
+                    match self.pick(&q, &opts) {
+                        Some(0) => ch.push(Choice::Ours),
+                        Some(1) => ch.push(Choice::Theirs),
+                        Some(2) => ch.push(Choice::Both),
+                        Some(_) => {
+                            skipped.push(format!("{} (laissé en conflit à votre demande)", e.path));
+                            continue 'files;
+                        }
+                        None => {
+                            cancelled = true;
+                            skipped.push(format!("{} (annulé)", e.path));
+                            break 'files;
+                        }
+                    }
+                }
+                ch
+            };
+            let out = conflicts::render(&segs, &choices)?;
+            std::fs::create_dir_all(&bdir).map_err(|er| format!("sauvegarde impossible, résolution annulée : {er}"))?;
+            std::fs::write(bdir.join(e.path.replace(['/', '\\'], "__")), &data).map_err(|er| format!("sauvegarde impossible, résolution annulée : {er}"))?;
+            std::fs::write(&abs, &out).map_err(|er| format!("écriture de {} impossible : {er}", e.path))?;
+            self.git.out(repo, &["add", "--", &e.path], Kind::Local)?;
+            done.push((e.path.clone(), n));
+        }
+        let still: Vec<String> = self.git.status(repo)?.into_iter().filter(|e| e.conflicted() && done.iter().any(|d| d.0 == e.path)).map(|e| e.path).collect();
+        if !still.is_empty() {
+            return Err(format!("{} fichier(s) restent en conflit après résolution : {}", still.len(), list_names(still.iter().map(|s| s.as_str()), 5)));
+        }
+        if done.is_empty() {
+            return Err(if cancelled { "résolution annulée : rien n'a été modifié".to_string() } else { format!("aucun fichier résolu :\n    - {}", skipped.join("\n    - ")) });
+        }
+        let left = self.git.status(repo)?.iter().filter(|e| e.conflicted()).count();
+        let mut msg = format!(
+            "{} fichier(s) résolu(s) ({} zone(s)) : {}. Fichiers d'origine sauvegardés dans {}",
+            done.len(),
+            done.iter().map(|d| d.1).sum::<usize>(),
+            list_names(done.iter().map(|d| d.0.as_str()), 6),
+            bdir.display()
+        );
+        if !skipped.is_empty() {
+            msg += &format!("\n  Non traité(s) :\n    - {}", skipped.join("\n    - "));
+        }
+        msg += &if left > 0 { format!("\n  Il reste {left} fichier(s) en conflit.") } else { "\n  Plus aucun conflit : dites « termine la fusion ».".to_string() };
+        Ok(msg)
     }
 
     fn abort_merge(&self, path: &Option<String>) -> Res<String> {
@@ -1786,5 +2061,117 @@ mod tests_v02 {
         assert!(go(&a, json!({"action":"create_tag","path":"proj","name":"v1.0.0"})).unwrap_err().contains("existe déjà"));
         assert!(go(&a, json!({"action":"create_tag","path":"proj","name":"a b"})).is_err());
         assert!(go(&a, json!({"action":"create_tag","path":"proj","name":"-x"})).is_err());
+    }
+
+    // ---- v0.6 : conflits zone par zone, commit IA, apprentissage
+
+    struct Mock(&'static str, bool);
+    impl Llm for Mock {
+        fn name(&self) -> String {
+            "faux moteur".into()
+        }
+        fn is_local(&self) -> bool {
+            self.1
+        }
+        fn chat(&self, _s: &str, user: &str, _sch: Option<&serde_json::Value>, _m: u32) -> Res<String> {
+            assert!(!user.contains("contenu secret"), "le contenu des fichiers ne doit jamais être transmis");
+            Ok(self.0.to_string())
+        }
+    }
+
+    /// Deux zones de conflit distinctes (lignes 2 et 11 d'un fichier de 12 lignes).
+    fn two_hunk_repo(name: &str) -> (Agent, PathBuf) {
+        let (a, _b, p) = setup(name);
+        let base: Vec<String> = (1..=12).map(|i| format!("l{i}")).collect();
+        let write = |f: &dyn Fn(usize, &str) -> String| base.iter().enumerate().map(|(i, l)| f(i, l)).collect::<Vec<_>>().join("\n") + "\n";
+        commit_file(&a, &p, "a.txt", &base.join("\n"), "base");
+        go(&a, json!({"action":"create_branch","path":"proj","name":"x"})).unwrap();
+        commit_file(&a, &p, "a.txt", &write(&|i, l| if i == 1 || i == 10 { format!("X-{l}") } else { l.to_string() }), "x");
+        go(&a, json!({"action":"switch_branch","path":"proj","name":"main"})).unwrap();
+        commit_file(&a, &p, "a.txt", &write(&|i, l| if i == 1 || i == 10 { format!("M-{l}") } else { l.to_string() }), "main");
+        go(&a, json!({"action":"merge_branch","path":"proj","name":"x","keep_conflicts":true})).unwrap();
+        (a, p)
+    }
+
+    #[test]
+    fn conflits_zone_par_zone() {
+        let (a, p) = two_hunk_repo("hk1");
+        let r = go(&a, json!({"action":"inspect_conflicts","path":"proj"})).unwrap();
+        assert!(r.contains("2 zone"), "{r}");
+        a.test_choices.lock().unwrap().extend([0, 1]); // zone 1 : ma version ; zone 2 : version fusionnée
+        let r = go(&a, json!({"action":"resolve_conflicts","path":"proj","strategy":"ask"})).unwrap();
+        assert!(r.contains("2 zone") && r.contains("termine la fusion"), "{r}");
+        let txt = std::fs::read_to_string(p.join("a.txt")).unwrap();
+        assert!(txt.contains("M-l2") && txt.contains("X-l11") && !txt.contains("X-l2") && !txt.contains("<<<<"), "{txt}");
+        assert!(p.join(".git").join("drenn-backup").is_dir());
+        assert!(go(&a, json!({"action":"continue_merge","path":"proj"})).unwrap().contains("terminée"));
+    }
+
+    #[test]
+    fn conflits_zone_par_zone_annulation_et_les_deux() {
+        let (a, p) = two_hunk_repo("hk2");
+        // aucune réponse (annulation) : rien n'est modifié
+        let e = go(&a, json!({"action":"resolve_conflicts","path":"proj","strategy":"ask"})).unwrap_err();
+        assert!(e.contains("annulée"), "{e}");
+        assert!(std::fs::read_to_string(p.join("a.txt")).unwrap().contains("<<<<<<<"));
+        assert!(go(&a, json!({"action":"continue_merge","path":"proj"})).is_err());
+        // « passer ce fichier » : laissé en conflit
+        a.test_choices.lock().unwrap().push_back(3);
+        assert!(go(&a, json!({"action":"resolve_conflicts","path":"proj","strategy":"ask"})).is_err());
+        // les deux versions
+        let r = go(&a, json!({"action":"resolve_conflicts","path":"proj","strategy":"both"})).unwrap();
+        assert!(r.contains("2 zone"), "{r}");
+        let txt = std::fs::read_to_string(p.join("a.txt")).unwrap();
+        assert!(txt.contains("M-l2\nX-l2\n") && txt.contains("M-l11\nX-l11\n"), "{txt}");
+    }
+
+    #[test]
+    fn message_de_commit_par_ia_locale() {
+        let (mut a, _b, p) = setup("aimsg");
+        std::fs::write(p.join("a.txt"), "contenu secret").unwrap();
+        a.llm = Some(Arc::new(Mock("\"feat: ajoute le fichier a.\"\nexplication inutile", true)));
+        go(&a, json!({"action":"stage_changes","path":"proj"})).unwrap();
+        let r = go(&a, json!({"action":"create_commit","path":"proj"})).unwrap();
+        assert!(r.contains("« feat: ajoute le fichier a »"), "{r}");
+    }
+
+    #[test]
+    fn message_de_commit_jamais_par_le_cloud() {
+        let (mut a, _b, p) = setup("aimsg2");
+        std::fs::write(p.join("a.txt"), "x").unwrap();
+        a.llm = Some(Arc::new(Mock("feat: ne doit pas servir", false)));
+        go(&a, json!({"action":"stage_changes","path":"proj"})).unwrap();
+        let r = go(&a, json!({"action":"create_commit","path":"proj"})).unwrap();
+        assert!(r.contains("Premier commit"), "{r}");
+    }
+
+    #[test]
+    fn nettoyage_des_messages_de_modele() {
+        assert_eq!(clean_commit_message("Message : « fix: corrige »\nautre").as_deref(), Some("fix: corrige"));
+        assert_eq!(clean_commit_message("\n\n`chore: x y`.").as_deref(), Some("chore: x y"));
+        assert_eq!(clean_commit_message(&"a".repeat(200)).unwrap().chars().count(), 72);
+        assert!(clean_commit_message("   ").is_none() && clean_commit_message("ok").is_none());
+    }
+
+    #[test]
+    fn apprentissage_et_glossaire() {
+        let (a, _b, _p) = setup("teach");
+        assert!(a.handle("c'est quoi un commit ?"));
+        assert!(!a.teach.load(Ordering::SeqCst));
+        assert!(a.handle("active le mode apprentissage"));
+        assert!(a.teach.load(Ordering::SeqCst));
+        assert!(a.handle("désactive le mode apprentissage"));
+        assert!(!a.teach.load(Ordering::SeqCst));
+        // question sans réponse dans le glossaire et sans modèle : échec propre
+        assert!(!a.handle("c'est quoi le zorglub ?"));
+    }
+
+    #[test]
+    fn consentement_cloud() {
+        let (a, _b, _p) = setup("cloud");
+        let cloud = Mock("{}", false);
+        assert!(a.allow_llm(&cloud)); // test_yes simule « oui »
+        assert!(a.cloud_ok.load(Ordering::SeqCst));
+        assert!(a.allow_llm(&Mock("{}", true))); // un moteur local ne demande jamais d'accord
     }
 }

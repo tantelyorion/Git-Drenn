@@ -145,20 +145,20 @@ pub fn serve(agent: Arc<Agent>, open_browser: bool) -> Res<()> {
 
 fn open_url(url: &str) {
     use std::process::{Command, Stdio};
-    let mut cmd = if cfg!(windows) {
-        let mut c = Command::new("cmd");
-        c.args(["/C", "start", "", url]);
-        c
+    // Windows : start ; macOS : open ; Linux et BSD : xdg-open puis solutions de repli.
+    let candidates: Vec<(&str, Vec<&str>)> = if cfg!(windows) {
+        vec![("cmd", vec!["/C", "start", "", url])]
     } else if cfg!(target_os = "macos") {
-        let mut c = Command::new("open");
-        c.arg(url);
-        c
+        vec![("open", vec![url])]
     } else {
-        let mut c = Command::new("xdg-open");
-        c.arg(url);
-        c
+        vec![("xdg-open", vec![url]), ("gio", vec!["open", url]), ("sensible-browser", vec![url]), ("x-www-browser", vec![url])]
     };
-    let _ = cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn();
+    for (prog, args) in candidates {
+        if Command::new(prog).args(&args).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().is_ok() {
+            return;
+        }
+    }
+    // Aucun ouvreur : l'adresse a déjà été affichée, il suffit de la copier dans un navigateur.
 }
 
 struct Req {
@@ -332,6 +332,7 @@ fn handle_conn(mut s: TcpStream, ctx: &Ctx) -> Result<(), ()> {
         ("POST", "/api/quit") => {
             json_resp(&mut s, 200, json!({"bye": true}));
             let _ = s.flush();
+            crate::llm::shutdown_all();
             std::process::exit(0);
         }
         _ => respond(&mut s, 404, "text/plain; charset=utf-8", b"Introuvable"),

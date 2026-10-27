@@ -1,80 +1,95 @@
-# GIT DRENN — Guide du moteur IA (LLM)
+# GIT DRENN — Guide du moteur IA
 
 *GIT DRENN est créé par **Mr Tantely Orion**.*
 
-> **Honnêteté d'abord.** Le code qui appelle le modèle (`src/planner.rs`) est testé avec des faux modèles et des cas
-> d'erreur, mais **pas encore avec un vrai modèle Qwen + llama.cpp** (pas de téléchargement possible dans l'environnement
-> de développement). Les procédures ci-dessous sont les procédures standard ; `drenn doctor` et `drenn bench` vous diront
-> si tout fonctionne chez vous.
+> **Honnêteté d'abord.** Le code est testé avec de faux moteurs (un faux `llama-server` lancé, utilisé puis arrêté ; de faux serveurs HTTP
+> pour l'API locale et le cloud). Il n'a **pas encore été essayé avec un vrai modèle Qwen** ni avec un vrai service cloud (pas de téléchargement
+> possible dans l'environnement de développement). `drenn doctor` puis `drenn bench` vous diront si tout fonctionne chez vous.
 
-## 1. Comment ça marche
+## 1. Principe (inchangé : sécurité d'abord)
 
 ```
-Votre phrase ──► Modèle IA (LLM local) ──► Plan JSON ──► Validation stricte ──► Confirmation ──► Exécution Git ──► Vérification
+Votre phrase ──► Moteur IA ──► Plan JSON ──► Validation stricte ──► Confirmation ──► Exécution Git ──► Vérification
 ```
 
-- Le modèle **ne fait que traduire** votre phrase en un plan composé d'actions prédéfinies (`stage_changes`, `create_commit`, `push_changes`…).
-- Il n'exécute **jamais** de commande : c'est le moteur Rust qui valide, demande confirmation et exécute.
-- Il ne voit **jamais** le contenu de vos fichiers ni vos messages de commit.
-- Sans modèle, un **analyseur de règles** (français/anglais) couvre déjà les demandes courantes. Le modèle sert aux phrases
-  plus libres ou mal formulées. Si le modèle se trompe ou répond mal, l'agent retombe sur les règles.
+Le moteur ne fait que **traduire** votre phrase en actions prédéfinies. Il n'exécute rien. Il ne voit **jamais** le contenu de vos fichiers,
+ni vos conflits de fusion. Sans moteur, l'analyseur de règles (français/anglais) couvre les demandes courantes ; en cas d'échec du moteur,
+l'agent retombe sur les règles.
 
-## 2. Quel modèle choisir ?
+## 2. Les trois moteurs (`drenn config set backend …`)
 
-Il faut un **petit modèle « Instruct »**, au format **GGUF**, quantifié **Q4_K_M**. Le gabarit de `planner.rs` est du ChatML : la famille **Qwen** convient directement.
-
-| Votre PC | Modèle conseillé | Taille du fichier | RAM utilisée pendant l'analyse |
-|---|---|---|---|
-| 4 Go de RAM | **Qwen2.5-1.5B-Instruct** Q4_K_M | ≈ 1,1 Go | ≈ 1,5 à 2 Go |
-| 8 Go de RAM ou plus | **Qwen2.5-3B-Instruct** Q4_K_M | ≈ 2 Go | ≈ 2,5 à 3 Go |
-| PC très faible | Qwen2.5-0.5B-Instruct Q4_K_M | ≈ 0,4 Go | < 1 Go (moins fiable) |
-
-Des modèles plus récents (Qwen3, etc.) existent peut-être : si vous en essayez un, lancez `drenn bench` pour comparer
-(un modèle « raisonneur » qui écrit d'abord ses pensées peut gêner la sortie JSON).
-Un modèle plus gros n'est pas forcément meilleur ici : la sortie est **contrainte par un schéma JSON**, donc un petit modèle suffit.
-
-## 3. Installation (méthode guidée, Windows)
-
-1. Installez GIT DRENN (`scripts\install.ps1`).
-2. Lancez :
-   ```powershell
-   powershell -ExecutionPolicy Bypass -File scripts\setup-model.ps1
-   ```
-   Le script cherche la dernière version de **llama.cpp** (Windows CPU), propose les modèles Qwen ci-dessus selon votre RAM,
-   demande votre accord avant chaque téléchargement, affiche l'empreinte SHA-256 puis configure GIT DRENN.
-3. Vérifiez : `drenn doctor` puis `drenn bench`.
-
-## 4. Installation manuelle
-
-1. Téléchargez `llama-cli.exe` : https://github.com/ggml-org/llama.cpp/releases (archive Windows **CPU x64**) et dézippez-la.
-2. Téléchargez un fichier `.gguf` (page Hugging Face du modèle, onglet *Files*).
-3. Configurez :
-   ```powershell
-   drenn config set llama_bin  "C:\chemin\llama-cli.exe"
-   drenn config set model_path "C:\chemin\qwen2.5-1.5b-instruct-q4_k_m.gguf"
-   drenn doctor
-   ```
-
-## 5. Réglages utiles (`drenn config`)
-
-| Clé | Rôle | Conseil |
+| `backend` | Fonctionnement | Quand l'utiliser |
 |---|---|---|
-| `threads` | cœurs utilisés | nombre de cœurs physiques (max 4 par défaut) |
-| `ctx_size` | contexte | 2048 suffit |
-| `max_tokens` | longueur max de la réponse | 512 |
-| `llama_timeout_secs` | délai maximal | augmentez si le PC est lent |
-| `use_json_schema` | force le JSON valide | laissez à `true` |
+| `server` | **llama-server** lancé à la première demande et **gardé en mémoire** (déchargé après `server_idle_secs`, 300 s par défaut). Réponses rapides. Peut aussi être un serveur local existant (`server_url`, ex. Ollama). Utilise le gabarit de chat du modèle : tout modèle « Instruct » convient. | Recommandé. |
+| `cli` | `llama-cli` relancé à chaque demande : rien en mémoire au repos, mais lent (rechargement). Gabarit ChatML (famille Qwen). | PC très limité. |
+| `cloud` | API distante (Anthropic ou compatible OpenAI). **Désactivé par défaut**, voir §5. | PC trop faible pour un modèle local. |
+| `rules` | Aucun modèle. | Mode minimal. |
+| `auto` (défaut) | serveur → cli → cloud (seulement si activé) → règles. | |
 
-## 6. Dépannage
+## 3. Installation en deux commandes (tous systèmes)
 
-- **« llama.cpp a échoué »** : lancez `drenn doctor` ; vérifiez les chemins ; essayez `drenn --no-ai "…"` pour confirmer que le reste fonctionne.
-- **Très lent** : prenez un modèle plus petit ou augmentez `llama_timeout_secs`. Le modèle est rechargé à chaque demande (voir §7).
-- **Mauvais plans** : `drenn bench` ; essayez le modèle 3B ; reformulez plus précisément.
+```
+drenn model engine     # trouve llama-server / llama-cli ; sinon donne la procédure de VOTRE système
+drenn model install    # choisit le modèle selon votre RAM, télécharge, vérifie le SHA-256, configure
+```
 
-## 7. Améliorations possibles (prochaines étapes)
+| Votre PC | Modèle (Q4_K_M) | Fichier | RAM pendant l'analyse |
+|---|---|---|---|
+| 4 Go | `qwen2.5-1.5b` | ≈ 1,1 Go | ≈ 1,5–2 Go |
+| 8 Go et plus | `qwen2.5-3b` | ≈ 2 Go | ≈ 2,5–3 Go |
+| très faible | `qwen2.5-0.5b` | ≈ 0,4 Go | < 1 Go (moins fiable) |
 
-1. **Serveur llama.cpp persistant** (`llama-server`, API locale compatible OpenAI) : le modèle resterait chargé, les réponses passeraient de plusieurs secondes à moins d'une seconde, au prix de la RAM occupée en permanence.
-2. **Mode « cloud » facultatif** (API d'un fournisseur de LLM) pour les PC trop faibles : à n'activer que si vous acceptez d'envoyer vos phrases (jamais le contenu des dépôts) à un service externe.
-3. **Messages de commit générés par l'IA** à partir d'un résumé *local* des fichiers modifiés (noms et statistiques seulement, jamais le contenu).
-4. **Explications pédagogiques** : « que va faire cette commande Git ? » pour apprendre Git en l'utilisant.
-5. Conflits de fusion **ligne par ligne** (aujourd'hui : fichier entier).
+`drenn model list` montre la liste et le modèle conseillé. Le téléchargement reprend s'il est interrompu ; si l'empreinte publiée par
+Hugging Face ne correspond pas, le fichier est supprimé. Sous Windows, `scripts\setup-model.ps1` fait aussi le travail pas à pas.
+
+**Autre modèle** : téléchargez un `.gguf` « Instruct », puis `drenn config set model_path <fichier>`, `drenn bench` pour comparer.
+Évitez les modèles qui « réfléchissent à voix haute » : ils gênent la sortie JSON.
+
+### Utiliser Ollama ou LM Studio (déjà installé)
+
+```
+drenn config set server_url  http://127.0.0.1:11434
+drenn config set server_model qwen2.5:1.5b
+```
+Seules les adresses de **cette machine** sont acceptées : vos phrases ne circulent jamais sur le réseau local.
+
+## 4. Fonctions IA ajoutées
+
+- **Messages de commit par IA** : « enregistre mes modifications » sans message → le modèle **local** rédige une ligne (`feat: …`) à partir de la
+  nature du changement et du **nom** des fichiers, jamais de leur contenu, jamais via le cloud. Réglages : `ai_commit_messages`, `commit_lang` (fr/en).
+  Si le modèle répond mal, le message standard est utilisé.
+- **Mode apprentissage** (`--teach`, `drenn config set teach_mode oui`, ou « active le mode apprentissage ») : chaque étape affiche la commande Git
+  équivalente et une explication. Textes fixes : aucune invention possible.
+- **Explications** : « c'est quoi un commit ? », « explique le stash » → glossaire intégré (conflit, branche, fusion, remote…) ; hors glossaire, le modèle
+  répond en texte simple (aucune action possible).
+- **Conflits zone par zone** : « résous les conflits un par un » → pour chaque zone, vous voyez les deux versions et choisissez : la vôtre, l'autre, les deux,
+  ou passer le fichier. Les fichiers d'origine sont sauvegardés dans `.git/drenn-backup/`. « … en gardant les deux » traite toutes les zones d'un coup.
+  Fins de ligne et encodage conservés ; fichiers binaires ou mal formés ignorés avec explication.
+
+## 5. Mode cloud (facultatif, à vos risques)
+
+1. `drenn auth cloud` (clé API, stockée dans `~/.drenn/cloud_key`, droits restreints sous Unix) — ou variable `DRENN_CLOUD_KEY` / `ANTHROPIC_API_KEY` / `OPENAI_API_KEY`.
+2. `drenn config set cloud_provider anthropic` (ou `openai`), éventuellement `cloud_model`, `cloud_url` (https obligatoire).
+3. `drenn config set cloud_enabled oui` puis `drenn config set backend cloud` (ou laissez `auto` : le cloud n'est utilisé que si aucun moteur local n'existe).
+
+Garanties : **une confirmation à chaque session** avant le premier envoi ; seule votre **phrase** et un contexte minimal (nom de branche assaini, nombre de fichiers modifiés)
+partent ; jamais le contenu des dépôts, ni les noms de fichiers (pas de message de commit par le cloud), ni les conflits ; la clé n'apparaît dans aucun message d'erreur.
+Le modèle par défaut (`claude-haiku-5-5` pour Anthropic, `gpt-4o-mini` pour OpenAI) n'a pas été essayé ici : changez `cloud_model` si besoin.
+
+## 6. Réglages (`drenn config`)
+
+`backend`, `llama_server_bin`, `llama_bin`, `model_path`, `server_url`, `server_model`, `server_idle_secs`, `llama_server_extra_args`, `threads`, `ctx_size`,
+`max_tokens`, `llama_timeout_secs`, `use_json_schema`, `cloud_*`, `ai_commit_messages`, `commit_lang`, `teach_mode`.
+
+## 7. Dépannage
+
+- **`drenn doctor`** affiche le système, la RAM, le moteur actif et ce qui manque.
+- **« llama-server s'est arrêté au démarrage »** : mémoire insuffisante → modèle plus petit (`qwen2.5-0.5b`), ou `backend cli`.
+- **Trop lent / délai dépassé** : augmentez `llama_timeout_secs` ; vérifiez `threads`.
+- **Mauvais plans** : `drenn bench` ; essayez le 3B ; reformulez. Pour tester le reste sans IA : `drenn --no-ai "…"`.
+- **Arrêt brutal de GIT DRENN** : fermez un éventuel `llama-server` resté en mémoire (gestionnaire de tâches / `pkill llama-server`).
+
+## 8. Idées pour la suite
+
+Signature des binaires (macOS/Windows), mises à jour automatiques vérifiées, rebase assisté, résolution de conflits avec suggestion du modèle (à n'activer qu'en local),
+interface graphique avec aperçu coloré des différences.

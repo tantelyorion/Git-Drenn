@@ -7,7 +7,7 @@ use std::path::PathBuf;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
-    /// Chemin de `llama-cli` (llama.cpp). Absent = analyseur de règles uniquement.
+    /// Chemin de `llama-cli` (llama.cpp ; `llama-cli.exe` sous Windows). Sans moteur local ni cloud : analyseur de règles.
     pub llama_bin: Option<String>,
     /// Chemin du modèle GGUF quantifié (ex. Qwen 0.8B Q4).
     pub model_path: Option<String>,
@@ -29,6 +29,31 @@ pub struct Config {
     /// Autorise les hooks Git des projets (désactivés par défaut : ce sont des scripts non fiables).
     pub allow_hooks: bool,
     pub max_file_size_mb: u64,
+
+    // ---- v0.6 : moteurs IA
+    /// « auto » (serveur → processus → cloud si autorisé → règles), « server », « cli », « cloud » ou « rules ».
+    pub backend: String,
+    /// Chemin de `llama-server` (llama.cpp) : le modèle reste chargé entre deux demandes (déchargé après inactivité).
+    pub llama_server_bin: Option<String>,
+    pub llama_server_extra_args: Vec<String>,
+    /// Serveur déjà lancé, compatible OpenAI, SUR CETTE MACHINE uniquement (ex. http://127.0.0.1:11434 pour Ollama).
+    pub server_url: Option<String>,
+    /// Nom du modèle à demander au serveur (obligatoire pour Ollama, ex. « qwen2.5:1.5b »).
+    pub server_model: Option<String>,
+    /// Secondes d'inactivité avant de décharger le modèle de la mémoire (0 = jamais).
+    pub server_idle_secs: u64,
+    /// Autorise l'envoi de VOS PHRASES (jamais le contenu des dépôts) à un service cloud. Désactivé par défaut.
+    pub cloud_enabled: bool,
+    /// « anthropic » ou « openai » (toute API compatible OpenAI via cloud_url).
+    pub cloud_provider: String,
+    pub cloud_url: Option<String>,
+    pub cloud_model: Option<String>,
+    /// Messages de commit rédigés par le modèle LOCAL à partir des noms de fichiers (jamais de leur contenu).
+    pub ai_commit_messages: bool,
+    /// Langue des messages de commit générés : « fr » ou « en ».
+    pub commit_lang: String,
+    /// Mode apprentissage : affiche la commande Git équivalente et une explication pour chaque étape.
+    pub teach_mode: bool,
 }
 
 impl Default for Config {
@@ -50,6 +75,19 @@ impl Default for Config {
             network_timeout_secs: 600,
             allow_hooks: false,
             max_file_size_mb: 50,
+            backend: "auto".into(),
+            llama_server_bin: None,
+            llama_server_extra_args: vec![],
+            server_url: None,
+            server_model: None,
+            server_idle_secs: 300,
+            cloud_enabled: false,
+            cloud_provider: "anthropic".into(),
+            cloud_url: None,
+            cloud_model: None,
+            ai_commit_messages: true,
+            commit_lang: "fr".into(),
+            teach_mode: false,
         }
     }
 }

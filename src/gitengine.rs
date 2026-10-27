@@ -57,6 +57,11 @@ fn candidates() -> Vec<PathBuf> {
         if let Some(local) = std::env::var_os("LOCALAPPDATA") {
             v.push(PathBuf::from(local).join("Programs").join("Git").join("cmd").join("git.exe"));
         }
+    } else {
+        // Environnements au PATH réduit (applications graphiques, services) : emplacements usuels de macOS, Linux et BSD.
+        for p in ["/usr/bin/git", "/usr/local/bin/git", "/opt/homebrew/bin/git", "/usr/pkg/bin/git", "/opt/local/bin/git"] {
+            v.push(PathBuf::from(p));
+        }
     }
     v
 }
@@ -93,7 +98,7 @@ impl Git {
                 }
             }
         }
-        Err("Git est introuvable. Installez Git pour Windows (https://git-scm.com) puis relancez GIT DRENN.".into())
+        Err(format!("Git est introuvable. {} puis relancez GIT DRENN.", crate::util::git_install_hint()))
     }
 
     pub fn version(&self) -> String {

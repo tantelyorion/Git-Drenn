@@ -26,7 +26,11 @@ impl Risk {
 }
 
 /// Dossiers que l'agent n'approche jamais, même dans un dossier autorisé.
-const DENIED_COMPONENTS: &[&str] = &[".ssh", ".aws", ".gnupg", ".kube", ".docker", "appdata", ".drenn", ".git"];
+const DENIED_COMPONENTS: &[&str] = &[
+    ".ssh", ".aws", ".gnupg", ".kube", ".docker", "appdata", ".drenn", ".git",
+    // Trousseaux et gestionnaires de secrets (macOS, Linux, BSD).
+    "keychains", "keyrings", ".password-store", ".azure", ".gcloud",
+];
 
 pub struct Policy {
     roots: Vec<PathBuf>,
@@ -62,12 +66,14 @@ impl Policy {
     /// Valide qu'un chemin est dans le périmètre autorisé et renvoie sa forme canonique.
     pub fn check_path(&self, p: &Path) -> Res<PathBuf> {
         let c = canonicalize_lenient(p)?;
-        for comp in c.components() {
-            if let Component::Normal(n) = comp {
-                let n = n.to_string_lossy().to_lowercase();
-                if DENIED_COMPONENTS.contains(&n.as_str()) {
-                    return Err(format!("accès refusé : le dossier « {n} » est protégé"));
-                }
+        let parts: Vec<String> = c.components().filter_map(|k| if let Component::Normal(n) = k { Some(n.to_string_lossy().to_lowercase()) } else { None }).collect();
+        for (i, n) in parts.iter().enumerate() {
+            if DENIED_COMPONENTS.contains(&n.as_str()) {
+                return Err(format!("accès refusé : le dossier « {n} » est protégé"));
+            }
+            // macOS : ~/Library contient courrier, messages, cookies et trousseaux (un projet nommé « Library » reste permis).
+            if n == "library" && parts.get(i + 1).map(|x| ["application support", "mail", "messages", "cookies", "safari", "preferences", "containers", "group containers"].contains(&x.as_str())).unwrap_or(false) {
+                return Err("accès refusé : ce dossier de la bibliothèque système est protégé".into());
             }
         }
         if self.roots.iter().any(|r| c.starts_with(r)) {

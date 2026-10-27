@@ -3,12 +3,16 @@
 mod actions;
 mod agent;
 mod config;
+mod conflicts;
 mod github;
-mod gui;
 mod gitengine;
+mod gui;
+mod llm;
+mod model;
 mod planner;
 mod rules;
 mod security;
+mod teach;
 mod ui;
 mod util;
 
@@ -16,7 +20,9 @@ use agent::Agent;
 use config::Config;
 use std::path::PathBuf;
 
-const HELP: &str = "GIT DRENN 0.5.0 — Git piloté par un agent IA
+fn help_text() -> String {
+    format!(
+        "GIT DRENN {ver} — Git piloté par un agent IA
 Créateur : Mr Tantely Orion
 
 Utilisation :
@@ -29,15 +35,18 @@ Utilisation :
   drenn config init|path     crée la configuration / affiche son emplacement
   drenn config set <clé> <valeur>   modifie un réglage (ex. model_path, llama_bin, projects_dir)
   drenn config add-root <dossier>   autorise un dossier de travail supplémentaire
-  drenn bench                mesure le modèle local (validité, justesse, temps) sur des demandes types
+  drenn bench                mesure le moteur IA (validité, justesse, temps) sur des demandes types
+  drenn model [list|install [id]|engine]   choisit, télécharge (vérifié) et configure le modèle IA ; détecte llama.cpp
   drenn gui                  interface graphique locale dans le navigateur (--no-browser : ne l'ouvre pas)
   drenn about                la mascotte, la version et le créateur (Mr Tantely Orion)
   drenn auth login|logout|status   jeton GitHub (login : lit le jeton sur l'entrée standard)
+  drenn auth cloud|cloud-logout    clé API du mode cloud facultatif (voir docs/GUIDE_MODELE_IA.md)
 
 Options :
   --dir <dossier>    dossier de travail (défaut : dossier courant)
   --dry-run          affiche le plan sans rien exécuter
-  --no-ai            n'utilise pas le modèle local (analyseur de règles seul)
+  --no-ai            n'utilise aucun modèle (analyseur de règles seul)
+  --teach            mode apprentissage : commande Git équivalente et explication pour chaque étape
   --auto-medium      exécute sans confirmation les opérations locales (jamais push/suppression)
   -h, --help / -V, --version
 
@@ -45,25 +54,31 @@ Exemples :
   drenn \"clone mastodon dans mon dossier Projets\"
   drenn \"enregistre mes modifications\"
   drenn \"publie mon projet Blog sur GitHub\"
+  drenn \"résous les conflits un par un\"
+  drenn \"c'est quoi un commit ?\"
 
-GIT DRENN — créé par Mr Tantely Orion.";
+GIT DRENN — créé par Mr Tantely Orion.",
+        ver = env!("CARGO_PKG_VERSION")
+    )
+}
 
 fn main() {
     ui::setup_console();
     let code = run();
+    llm::shutdown_all();
     std::process::exit(code);
 }
 
 fn run() -> i32 {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
     let mut dir: Option<PathBuf> = None;
-    let (mut dry, mut no_ai, mut auto_medium, mut no_browser) = (false, false, false, false);
+    let (mut dry, mut no_ai, mut auto_medium, mut no_browser, mut teach_flag) = (false, false, false, false, false);
     let mut rest: Vec<String> = Vec::new();
     let mut it = args.drain(..);
     while let Some(a) = it.next() {
         match a.as_str() {
             "-h" | "--help" => {
-                ui::say(HELP);
+                ui::say(help_text());
                 return 0;
             }
             "-V" | "--version" => {
@@ -81,6 +96,7 @@ fn run() -> i32 {
             "--no-ai" => no_ai = true,
             "--auto-medium" => auto_medium = true,
             "--no-browser" => no_browser = true,
+            "--teach" => teach_flag = true,
             _ => rest.push(a),
         }
     }
@@ -95,10 +111,14 @@ fn run() -> i32 {
     if auto_medium {
         cfg.auto_confirm_medium = true;
     }
+    if teach_flag {
+        cfg.teach_mode = true;
+    }
     let cwd = dir.unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
 
     match rest.first().map(|s| s.as_str()) {
         Some("config") => return cmd_config(&cfg, &rest[1..]),
+        Some("model") => return model::run(&cfg, &rest[1..]),
         Some("about") => {
             ui::banner(env!("CARGO_PKG_VERSION"));
             return 0;
@@ -150,7 +170,7 @@ fn repl(agent: &Agent) -> i32 {
         match l.to_lowercase().as_str() {
             "" => continue,
             "quitter" | "exit" | "quit" | "q" => return 0,
-            "aide" | "help" | "?" => ui::say(HELP),
+            "aide" | "help" | "?" => ui::say(help_text()),
             "a propos" | "à propos" | "about" => ui::say(ui::about_text()),
             "historique" | "history" => agent::show_history(10),
             "projets" | "projects" => {
@@ -188,20 +208,52 @@ fn cmd_doctor(agent: &Agent) -> i32 {
     let curl = util::run_cmd(std::process::Command::new("curl").arg("--version"), None, std::time::Duration::from_secs(10));
     match curl {
         Ok(o) if o.ok() => ui::ok(format!("curl : {}", o.stdout.lines().next().unwrap_or(""))),
-        _ => ui::warn("curl introuvable : les fonctions GitHub (API) seront indisponibles"),
+        _ => ui::warn(format!("curl introuvable : GitHub, le mode cloud et `drenn model install` seront indisponibles — {}", util::curl_install_hint())),
     }
-    match (&agent.cfg.llama_bin, &agent.cfg.model_path) {
-        (Some(b), Some(m)) => {
-            let bin_ok = std::path::Path::new(b).is_file();
-            let model = std::fs::metadata(m).map(|x| x.len()).ok();
-            if bin_ok { ui::ok(format!("llama.cpp : {b}")) } else { ui::warn(format!("llama-cli introuvable : {b}")) }
-            match model {
-                Some(sz) => ui::ok(format!("Modèle : {m} ({} Mo — compte environ autant en RAM pendant l'analyse)", sz / 1024 / 1024)),
-                None => ui::warn(format!("modèle introuvable : {m}")),
+    ui::say(format!("Système : {} · mémoire vive : {}", util::os_name(), util::total_ram_mb().map(|r| format!("{:.1} Go", r as f64 / 1024.0)).unwrap_or_else(|| "inconnue".into())));
+    let c = &agent.cfg;
+    let model_ok = c.model_path.as_ref().map(|m| std::path::Path::new(m).is_file());
+    if let Some(m) = &c.model_path {
+        match std::fs::metadata(m).map(|x| x.len()) {
+            Ok(sz) => ui::ok(format!("Modèle : {m} ({} Mo — compte environ autant en RAM pendant l'analyse)", sz / 1024 / 1024)),
+            Err(_) => ui::warn(format!("modèle introuvable : {m}")),
+        }
+    }
+    for (label, bin) in [("llama-server", &c.llama_server_bin), ("llama-cli", &c.llama_bin)] {
+        if let Some(b) = bin {
+            let found = std::path::Path::new(b).is_file() || util::find_binary(b, &[]).is_some();
+            if found { ui::ok(format!("{label} : {b}")) } else { ui::warn(format!("{label} introuvable : {b} (`drenn model engine`)")) }
+        }
+    }
+    if let Some(u) = &c.server_url {
+        match llm::parse_loopback_url(u) {
+            Ok((h, p, _)) => match llm::http_request(&h, p, "GET", "/health", None, std::time::Duration::from_secs(3)) {
+                Ok((code, _)) if code < 500 => ui::ok(format!("Serveur IA local : {u} (répond)")),
+                _ => ui::warn(format!("Serveur IA local : {u} ne répond pas (lancé ? Ollama / LM Studio / llama-server)")),
+            },
+            Err(e) => ui::warn(format!("server_url refusé : {e}")),
+        }
+    }
+    if c.cloud_enabled {
+        if llm::load_cloud_key(&c.cloud_provider).is_some() {
+            ui::ok(format!("Mode cloud : activé ({}). Vos phrases seront envoyées à ce service après votre accord à chaque session ; jamais le contenu de vos dépôts.", c.cloud_provider));
+        } else {
+            ui::warn("Mode cloud activé mais clé API absente : `drenn auth cloud`");
+        }
+    }
+    match &agent.llm {
+        Some(l) => ui::ok(format!("Moteur IA actif : {}{}", l.name(), if l.is_local() { "" } else { "  (ATTENTION : distant)" })),
+        None => {
+            if c.backend == "rules" {
+                ui::info("Moteur IA désactivé (backend = rules) : analyseur de règles seul.");
+            } else if model_ok == Some(false) {
+                ui::warn("Aucun moteur IA utilisable : le fichier modèle est introuvable.");
+            } else {
+                ui::info("Aucun moteur IA configuré : l'analyseur de règles est utilisé. Pour activer l'IA : `drenn model engine` puis `drenn model install`.");
             }
         }
-        _ => ui::info("Modèle IA non configuré : l'analyseur de règles est utilisé (voir README, section « Modèle IA »)."),
     }
+    ui::say(format!("Mode apprentissage : {} · messages de commit par IA locale : {}", if c.teach_mode { "oui" } else { "non (option --teach)" }, if c.ai_commit_messages { "oui" } else { "non" }));
     if agent.gh.has_token() { ui::ok("Jeton GitHub : présent") } else { ui::info("Jeton GitHub : absent (`drenn auth login`)") }
     ui::say(format!("Configuration : {}", config::config_path().display()));
     ui::say(format!("Dossiers autorisés : {}", agent.policy.roots().iter().map(|r| r.display().to_string()).collect::<Vec<_>>().join(" ; ")));
@@ -289,7 +341,53 @@ fn config_set(cfg: &Config, key: &str, val: &str) -> i32 {
         }
     };
     let new = match key {
-        "llama_bin" | "model_path" | "projects_dir" => {
+        "backend" => match val {
+            "auto" | "server" | "cli" | "cloud" | "rules" => Ok(Value::String(val.into())),
+            _ => Err("attendu : auto, server, cli, cloud ou rules".into()),
+        },
+        "cloud_provider" => match val {
+            "anthropic" | "openai" => Ok(Value::String(val.into())),
+            _ => Err("attendu : anthropic ou openai".into()),
+        },
+        "commit_lang" => match val {
+            "fr" | "en" => Ok(Value::String(val.into())),
+            _ => Err("attendu : fr ou en".into()),
+        },
+        "server_url" => {
+            if val.is_empty() || val == "none" {
+                Ok(Value::Null)
+            } else {
+                llm::parse_loopback_url(val).map(|_| Value::String(val.trim_end_matches('/').into()))
+            }
+        }
+        "cloud_url" => {
+            if val.is_empty() || val == "none" {
+                Ok(Value::Null)
+            } else if val.starts_with("https://") {
+                Ok(Value::String(val.into()))
+            } else {
+                Err("l'adresse du service cloud doit commencer par https://".into())
+            }
+        }
+        "server_model" | "cloud_model" => {
+            if val.is_empty() || val == "none" {
+                Ok(Value::Null)
+            } else if val.len() > 100 || val.chars().any(|c| c.is_control() || c.is_whitespace()) {
+                Err("nom de modèle invalide".into())
+            } else {
+                Ok(Value::String(val.into()))
+            }
+        }
+        "server_idle_secs" => parse_num(0, 86400),
+        "cloud_enabled" => {
+            let r = parse_bool();
+            if matches!(r, Ok(Value::Bool(true))) {
+                ui::warn("Mode cloud : vos PHRASES (jamais le contenu de vos dépôts) seraient envoyées au service choisi, après votre accord à chaque session. Configurez la clé avec `drenn auth cloud`.");
+            }
+            r
+        }
+        "ai_commit_messages" | "teach_mode" => parse_bool(),
+        "llama_bin" | "llama_server_bin" | "model_path" | "projects_dir" => {
             if val.is_empty() || val == "none" {
                 Ok(Value::Null)
             } else {
@@ -334,10 +432,16 @@ fn config_set(cfg: &Config, key: &str, val: &str) -> i32 {
 }
 
 fn cmd_bench(agent: &Agent) -> i32 {
-    let Some(lp) = planner::LlamaPlanner::from_cfg(&agent.cfg) else {
-        ui::err("Modèle local non configuré : `drenn config set llama_bin <chemin>` et `drenn config set model_path <chemin>` (voir `drenn doctor`).");
+    let Some(lp) = agent.llm.clone() else {
+        ui::err("Aucun moteur IA configuré : lancez `drenn model engine` puis `drenn model install` (voir `drenn doctor`).");
         return 1;
     };
+    if !lp.is_local() {
+        ui::warn(format!("Le moteur est {} : le test enverra les 10 phrases ci-dessous à ce service.", lp.name()));
+        if !ui::confirm("Continuer ?") {
+            return 1;
+        }
+    }
     let cases = [
         ("clone mastodon", "clone_repository"),
         ("enregistre mes modifications", "stage_changes"),
@@ -351,11 +455,12 @@ fn cmd_bench(agent: &Agent) -> i32 {
         ("complète le gitignore", "update_gitignore"),
     ];
     let ctx = planner::PlanContext { cwd: agent.cwd.display().to_string(), in_repo: true, branch: Some("main".into()), dirty: 2, remotes: vec!["origin".into()] };
-    ui::say(format!("Test du modèle sur {} demandes types (peut prendre quelques minutes)…", cases.len()));
+    ui::say(format!("Test du moteur « {} » sur {} demandes types", lp.name(), cases.len()));
+    ui::say("(cela peut prendre quelques minutes)");
     let (mut valid, mut correct, mut total_ms) = (0usize, 0usize, 0u128);
     for (instr, expected) in cases {
         let t = std::time::Instant::now();
-        let r = lp.plan(instr, &ctx);
+        let r = planner::plan_with(lp.as_ref(), instr, &ctx, agent.cfg.max_tokens);
         let ms = t.elapsed().as_millis();
         total_ms += ms;
         match r {
@@ -373,7 +478,7 @@ fn cmd_bench(agent: &Agent) -> i32 {
     }
     let n = cases.len();
     ui::say(format!("\nPlans valides : {valid}/{n} · première action correcte : {correct}/{n} · temps moyen : {} ms", total_ms / n as u128));
-    ui::say("Mémoire : relevez le pic de RAM de llama-cli dans le Gestionnaire des tâches pendant ce test.");
+    ui::say("Mémoire : relevez le pic de RAM de llama-server / llama-cli (Gestionnaire des tâches, Moniteur d'activité, top…) pendant ce test.");
     if correct * 10 < n * 7 {
         ui::warn("Moins de 70 % de justesse : l'analyseur de règles prendra le relais, mais envisagez un modèle plus grand.");
     }
@@ -383,6 +488,39 @@ fn cmd_bench(agent: &Agent) -> i32 {
 fn cmd_auth(sub: Option<&str>) -> i32 {
     let file = github::token_file();
     match sub {
+        Some("cloud") => {
+            let cf = llm::cloud_key_file();
+            ui::say("Collez votre clé API (service cloud facultatif). Elle sera stockée dans :");
+            ui::say(format!("  {}", cf.display()));
+            ui::say("Activez ensuite le mode : drenn config set cloud_enabled oui");
+            let Some(k) = ui::read_line("Clé : ") else { return 1 };
+            let k = k.trim().to_string();
+            if k.len() < 16 || k.chars().any(|c| c.is_whitespace() || c.is_control()) {
+                ui::err("clé invalide");
+                return 1;
+            }
+            if let Some(d) = cf.parent() {
+                let _ = std::fs::create_dir_all(d);
+            }
+            if let Err(e) = std::fs::write(&cf, &k) {
+                ui::err(format!("écriture impossible : {e}"));
+                return 1;
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(&cf, std::fs::Permissions::from_mode(0o600));
+            }
+            ui::ok("Clé enregistrée.");
+            0
+        }
+        Some("cloud-logout") => {
+            match std::fs::remove_file(llm::cloud_key_file()) {
+                Ok(_) => ui::ok("Clé cloud supprimée."),
+                Err(_) => ui::info("Aucune clé cloud enregistrée."),
+            }
+            0
+        }
         Some("login") => {
             ui::say("Collez un jeton GitHub (permission « repo ») puis Entrée. Il sera stocké dans :");
             ui::say(format!("  {}", file.display()));
@@ -428,7 +566,7 @@ fn cmd_auth(sub: Option<&str>) -> i32 {
             0
         }
         Some(_) => {
-            ui::err("usage : drenn auth login|logout|status");
+            ui::err("usage : drenn auth login|logout|status|cloud|cloud-logout");
             2
         }
     }

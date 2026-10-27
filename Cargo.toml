@@ -1,6 +1,6 @@
 [package]
 name = "git-drenn"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2021"
 description = "GIT DRENN - Git Powered by AI : un agent léger qui transforme des instructions en opérations Git vérifiées"
 license = "MIT"
